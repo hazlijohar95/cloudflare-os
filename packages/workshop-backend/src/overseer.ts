@@ -8231,19 +8231,23 @@ class OverseerImpl implements AgentHooks {
             });
           };
 
-          let verifier = await clientUser.getVerifier(accountId, vendorId);
-          if (!verifier) {
-            // Account gone -> the overseer authors the reason. (Wrong vendor throws above.)
-            fail("This account is no longer connected.");
-            return;
-          }
-
           try {
+            let verifier = await clientUser.getVerifier(accountId, vendorId);
+            if (!verifier) {
+              // Account gone -> the overseer authors the reason. (Wrong vendor throws above.)
+              fail("This account is no longer connected.");
+              return;
+            }
             await this.getGatekeeperFacet(gk.id).addObserver(observerId, verifier);
             if (!preConfigured.has(gk.id)) newlyAdded.add(gk.id);
           } catch (err) {
             // Either a settled denial or an operational failure (expired credentials, upstream
-            // outage). Treat every failure as repairable and let the user try again.
+            // outage) -- whether from resolving the verifier or from the gatekeeper's
+            // addObserver. Treat every failure as repairable and let the user try again.
+            // getVerifier sits inside this try so its rejection (the wrong-vendor throw, or a
+            // cross-worker transport failure) scrubs the persisted coverage like any other
+            // refusal -- and so these callbacks never reject, which keeps the terminal catch's
+            // newlyAdded/invalidated snapshot from missing late-finishing siblings.
             fail(stringifyError(err), err);
           }
         }));

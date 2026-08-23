@@ -142,6 +142,47 @@ describe("ensureObserver per-profile serialization", () => {
     });
   });
 
+  it("a getVerifier rejection scrubs that gatekeeper's persisted coverage", async () => {
+    let stub = env.TEST_OVERSEER.getByName("observer-serialization-getverifier-rejection");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = (instance as unknown as { impl: any }).impl;
+      seedGatekeepers(impl);
+      // Already-configured coverage for both gatekeepers, as a previous successful open left it.
+      impl.storage.observers.put(
+          { profileId: "alice", observerId: "obs-1", accountChoices: { 1: 10, 2: 20 } });
+
+      let removed: number[] = [];
+      impl.getGatekeeperFacet = (id: number) => ({
+        addObserver: async () => {},
+        removeObserver: async () => { removed.push(id); },
+      });
+
+      // Gatekeeper 1's verifier never materializes: the client's User DO *rejects* (the
+      // deterministic vendor-mismatch throw, or any cross-worker transport failure) rather than
+      // returning null.
+      let failingClientUser = {
+        getVerifier: async (accountId: number) => {
+          if (accountId === 10) throw new Error("account is for a different vendor");
+          return {};
+        },
+        describeConnectedAccount: async () => null,
+      } as any;
+
+      // No repair channel, so the failure is terminal -- and descriptive, not the raw RPC error.
+      await expect(impl.ensureObserver("alice", failingClientUser, "build"))
+          .rejects.toThrow(/could not confirm/);
+
+      // The rejection went through fail(): gatekeeper 1's persisted coverage is scrubbed -- so
+      // the coverage guard stops admitting its restricted reads to this collaborator's older
+      // live sessions -- while gatekeeper 2's survives, and the refused registration was torn
+      // down on the gatekeeper.
+      let record = impl.storage.observers.get("alice");
+      expect(1 in record.accountChoices).toBe(false);
+      expect(record.accountChoices[2]).toBe(20);
+      expect(removed).toEqual([1]);
+    });
+  });
+
   it("keeps distinct profiles concurrent", async () => {
     let stub = env.TEST_OVERSEER.getByName("observer-serialization-distinct-profiles");
     await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
