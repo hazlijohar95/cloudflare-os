@@ -485,27 +485,29 @@ already in the JSDoc in `gatekeeper.ts`; add anything missing there rather than 
    The guard is scoped to the *producer* connections — those through which restricted data was
    actually read, derived from the permanent action log (`restrictedProducerIds`) — since only
    they anchor restricted-data verification; a non-producer connection stays removable while
-   shared. Unverifiable records (legacy, or no vendor account behind them) are exempt even as
-   producers — they anchor no verification, and removing one is itself a remedy. For a *legacy*
-   record that remedy is also an access-widening event for existing grants: while the record
-   exists, `#inScopeGatekeepers` throws on every non-owner open (a workspace-wide hard deny),
-   so removing it readmits existing collaborators — verified against only the surviving
-   connections, with the restricted data still in chat history. Accepted because the
-   alternative (requiring zero collaborators first, as for verifiable producers) would strand
-   the workspace: once the producer is gone, re-adding anyone is refused, so forced pre-removal
-   would make it permanently unshareable rather than usable by exactly the people who already
-   had grants. (The other unverifiable flavor — aiModel/agentSpawner, no vendor account —
-   widens nothing: it was never in any collaborator's verification scope, and its sensitive
-   reads were coverage-blocked whenever anyone was shared in.) Internal removals
-   (creation-failure rollback, ambient reconciliation) are unguarded.
+   shared. Unverifiable records (legacy, or no vendor account behind them) are guarded the same
+   way. They anchor no verification, but that is precisely what makes a *legacy* record a
+   blocker rather than a remedy: while it exists, `#inScopeGatekeepers` throws on every
+   non-owner open (a workspace-wide hard deny), so removing it while shared would readmit every
+   existing collaborator — verified against only the surviving connections, with the restricted
+   data still in chat history. Failing closed here strands the workspace deliberately: the
+   producer can only be removed after unsharing, and from then on re-adding anyone is refused
+   (`assertNewSharingAllowed` below), leaving it permanently owner-only. An automatic migration
+   of a legacy record is impossible — it never persisted the vendor identity, and the class
+   stub is opaque — so the documented recovery for an owner who wants to share such a workspace
+   is to start a new one. (The other unverifiable flavor — aiModel/agentSpawner, no vendor
+   account — widens nothing on removal: it was never in any collaborator's verification scope,
+   and its sensitive reads were coverage-blocked whenever anyone was shared in; it is guarded
+   anyway, uniformly.) Internal removals (creation-failure rollback, ambient reconciliation)
+   are unguarded.
    The complementary rule: once latched, if any producer connection no longer exists (removed
-   while the workspace was unshared, or an exempt unverifiable producer), a new party could no
-   longer be verified for the data, so everything that would admit one refuses
-   (`assertNewSharingAllowed`): the grant-creating sharing mutators — `addCollaborator`,
-   `createShareLink`, `newShareLinkKey` — and `redeemShareKey` at open(). Gating redemption is
-   what makes the unverifiable-producer exemption above safe despite outstanding keys: once any
-   producer is gone, those keys are dead too — refused before a pending edge is written, and
-   before a not-yet-confirmed edge is settled. The grant-creating mutators check synchronously
+   while the workspace was unshared, or removed before the guard covered unverifiable
+   producers), a new party could no longer be verified for the data, so everything that would
+   admit one refuses (`assertNewSharingAllowed`): the grant-creating sharing mutators —
+   `addCollaborator`, `createShareLink`, `newShareLinkKey` — and `redeemShareKey` at open().
+   Gating redemption is defense-in-depth now that removal itself refuses while links are
+   outstanding: once any producer is gone anyway, those keys are dead too — refused before a
+   pending edge is written, and before a not-yet-confirmed edge is settled. The grant-creating mutators check synchronously
    with their storage write, so a concurrent connection removal cannot slip between the check
    and the grant. Redemption is two-phase, so it checks twice: once synchronously with the
    *pending* write (`redeemShareKey`), and again in the *confirm's* synchronous block

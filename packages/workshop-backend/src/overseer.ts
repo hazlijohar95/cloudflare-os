@@ -396,8 +396,13 @@ function fallbackBindingName(base: string, isTaken: (name: string) => boolean): 
 
 function observerVendorId(record: GatekeeperRecord): string | null {
   if (!record.creationSpec) {
+    // There is no reconnect affordance for a legacy record (it never persisted its vendor
+    // identity), so the message points at the two real remedies: the owner removing the
+    // connection (allowed only while unshared), or moving the work to a new workspace.
     throw new Error(
-        "This workspace has a legacy connection that must be reconnected by its owner before it can be shared.");
+        "This workspace has a legacy connection that cannot verify collaborators' access. Its " +
+        "owner must remove the connection before the workspace can be shared, or start a new " +
+        "workspace.");
   }
   return "vendorId" in record.creationSpec ? record.creationSpec.vendorId : null;
 }
@@ -4600,17 +4605,37 @@ class OverseerImpl implements AgentHooks {
     return producers;
   }
 
+  // True if removing gatekeeper `id` is blocked because it anchors restricted-data verification:
+  // the workspace is latched, `id` is a restricted producer (or the producer set is unexpectedly
+  // empty -- see below), and the sharing graph still has collaborators or outstanding share
+  // links. Shared by GatekeeperClientImpl.remove() and the ambient reconciliation in
+  // ensureAmbientCapsules(): while the workspace is shared, deleting a producer's record would
+  // let a never-verified party see the data -- the record is what observer verification and the
+  // coverage guard run against, and for an unverifiable record it is what denies non-owner opens
+  // outright -- even though the restricted data outlives it in chat history and storage.
+  async removalBlockedByRestrictedData(id: WorkpieceId): Promise<boolean> {
+    if (!this.storage.prohibitAllSharing.get()) return false;
+    // An empty producer set with the latch set should be impossible: the latch and the action
+    // record are written in one synchronous block, built-in observations never latch, and
+    // records that predate the flag's rename still read correctly (see
+    // observationContainsRestrictedData). If it ever happens anyway, fall back to guarding
+    // every connection rather than none.
+    let producers = this.restrictedProducerIds();
+    if (producers.size > 0 && !producers.has(id)) return false;
+    let sharing = await this.getSharingManager();
+    return sharing.listCollaborators().length > 0 || sharing.listShareLinkRecords().length > 0;
+  }
+
   // Refuse a new sharing grant once the workspace has read restricted data through a connection
   // that no longer exists. A new collaborator's verification anchors on the producer connection's
   // record (ensureObserver and the coverage guard); with the record gone there is nothing to
   // verify them against, while the restricted data persists in chat history and storage. Grants
   // that predate the removal are untouched -- this guards only new ones, which includes share-key
   // *redemption* (open() passes this as redeemShareKey's assertGrantAllowed), so outstanding keys
-  // die with the producer rather than staying redeemable. Removing a *verifiable*
-  // producer already requires zero collaborators and zero share links (see
-  // GatekeeperClientImpl.remove()), so this bites after any producer was removed while the
-  // workspace was unshared, or after an unverifiable producer -- exempt from the removal guard
-  // as its own remedy -- was removed while links were outstanding.
+  // die with the producer rather than staying redeemable. Removing a producer already requires
+  // zero collaborators and zero share links (see removalBlockedByRestrictedData), so this bites
+  // after a producer was removed while the workspace was unshared (or removed before that guard
+  // covered unverifiable producers).
   assertNewSharingAllowed(): void {
     if (!this.storage.prohibitAllSharing.get()) return;
     for (let id of this.restrictedProducerIds()) {
@@ -11375,34 +11400,20 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
     // The guard applies only to the connections that themselves read restricted data (the
     // producers, derived from the action log): the latch is workspace-wide, but a non-producer
     // connection anchors no restricted-data verification, so it stays removable while shared.
-    // Unverifiable records (legacy, or no vendor account behind them) anchor no verification --
-    // removing one is itself a remedy -- so they stay removable too.
-    if (record && this.impl.storage.prohibitAllSharing.get()) {
-      let vendorId: string | null = null;
-      try {
-        vendorId = observerVendorId(record);
-      } catch {
-        // Legacy connection with no creationSpec: unverifiable, exempt from the guard.
-      }
-      if (vendorId !== null) {
-        // An empty producer set with the latch set should be impossible: the latch and the action
-        // record are written in one synchronous block, built-in observations never latch, and
-        // records that predate the flag's rename still read correctly (see
-        // observationContainsRestrictedData). If it ever happens anyway, fall back to guarding
-        // every connection rather than none.
-        let producers = this.impl.restrictedProducerIds();
-        if (producers.size === 0 || producers.has(this.id)) {
-          let sharing = await this.impl.getSharingManager();
-          if (sharing.listCollaborators().length > 0 ||
-              sharing.listShareLinkRecords().length > 0) {
-            throw new Error(
-                "This connection cannot be removed: it has read sensitive data into this " +
-                "workspace, and the workspace is shared. Collaborators are verified against this " +
-                "connection before they may see that data, so remove all collaborators and revoke " +
-                "all share links first.");
-          }
-        }
-      }
+    // Unverifiable producers (a legacy record with no creationSpec, or aiModel/agentSpawner with
+    // no vendor account) are guarded too: they anchor no verification, but that is exactly what
+    // makes a legacy record the *blocker* -- #inScopeGatekeepers throws on it, denying every
+    // non-owner open -- so removing it while shared would readmit every existing collaborator
+    // unverified. After an unshared removal the workspace is permanently owner-only
+    // (restrictedProducerIds() reads the never-forgetting action log) -- deliberate: nothing can
+    // verify a collaborator for the removed producer's data anymore, so the recovery for an
+    // owner who needs to share again is a new workspace.
+    if (record && await this.impl.removalBlockedByRestrictedData(this.id)) {
+      throw new Error(
+          "This connection cannot be removed: it has read sensitive data into this " +
+          "workspace, and the workspace is shared. Collaborators are verified against this " +
+          "connection before they may see that data, so remove all collaborators and revoke " +
+          "all share links first.");
     }
     this.impl.removeGatekeeper(this.id);
     this.impl.recordGadgetAnalytics({

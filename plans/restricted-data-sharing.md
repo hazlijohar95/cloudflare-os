@@ -246,9 +246,10 @@ verification denial) — that Part 4 here builds on.
   change during verification, so a redeemer is never confirmed against a scope narrower
   than what exists at confirm time.
 - **A producer removed before the fingerprint snapshot is invisible to both
-  fingerprints.** An unverifiable producer's `remove()` skips the share-link guard
-  entirely, so the scope check structurally cannot catch it. This is why the redemption
-  policy is re-asserted at the confirm and not only at the redeem.
+  fingerprints.** `remove()` now refuses every restricted producer (unverifiable ones
+  included) while any share link is outstanding, so the scope check can no longer be
+  structurally bypassed that way — but the confirm-time re-assertion of the redemption
+  policy stays, as defense-in-depth against any future removal path that skips the guard.
 - **The pending-edge re-add wart.** If the owner's `removeCollaborator` races a
   verification, the confirm re-adds the edge. Accepted: pending-only recipients are
   invisible to `listCollaborators`, so such a removal was necessarily aimed at an edge
@@ -265,17 +266,20 @@ verification denial) — that Part 4 here builds on.
 - **Role increases do not ride out on a redeeming open.** An owner grant landing while
   verification waited takes effect at the recipient's next open, exactly as for an
   ordinary keyless open.
-- **Open gap, NOT implemented in this PR — removing an unverifiable restricted producer
-  unblocks its collaborators.** `remove()`'s producer guard exempts unverifiable records
-  ("removing one is itself a remedy"), which is backwards once the data has been read:
-  the record is the *blocker* -- `#inScopeGatekeepers` throws on it, so no collaborator
-  can open -- and removing it lets every existing collaborator open unverified while the
-  restricted data persists in chat history, gadget storage and code.
-  `assertNewSharingAllowed` only stops *new* grants. Decided remedy, for a follow-up:
-  guard unverifiable producers like any other -- the owner must remove all collaborators
-  and revoke all share links before removal, after which the workspace is permanently
-  owner-only (`restrictedProducerIds()` reads the action log, which never forgets the
-  producer). Fail-closed and preferable to exposing data nothing can verify anymore.
+- **Removing an unverifiable restricted producer — implemented: guarded like any other.**
+  `remove()`'s producer guard used to exempt unverifiable records ("removing one is
+  itself a remedy"), which was backwards once the data had been read: the record is the
+  *blocker* -- `#inScopeGatekeepers` throws on it, so no collaborator can open -- and
+  removing it let every existing collaborator open unverified while the restricted data
+  persists in chat history, gadget storage and code (`assertNewSharingAllowed` only stops
+  *new* grants). Decided and implemented: fail closed -- unverifiable producers are
+  guarded like any other (the owner must remove all collaborators and revoke all share
+  links first), after which the workspace is permanently owner-only
+  (`restrictedProducerIds()` reads the action log, which never forgets the producer).
+  Deliberately no migration or reconnect flow: an automatic migration is impossible
+  (legacy records never persisted `vendorId`, and the class stub is opaque), and an
+  owner-driven reconnect flow was considered and rejected as scope. The documented
+  recovery for an owner who wants to share such a workspace is to start a new workspace.
 
 ## Accepted tradeoffs / future work
 
