@@ -87,6 +87,11 @@ access, and not row-level security or column policy tags. A collaborator admitte
 may therefore see query results they could not have run themselves. This is a known, accepted
 limitation.
 
+Relatedly, a query that references **no tables at all** is refused: it still runs with the
+owner's token and can return session/owner context (`SESSION_USER()`, `@@project_id`) that no
+dataset probe could verify an observer against. A query that pairs such a scalar function *with* a
+table reference (`SELECT SESSION_USER() FROM t LIMIT 1`) still runs; that owner-principal
+disclosure is accepted as part of the same metadata-class limitation above.
 ### Step 4: Test Users
 
 This is important! While your app is in "Testing" mode (which it will be by default), only users you explicitly add here can use OAuth.
