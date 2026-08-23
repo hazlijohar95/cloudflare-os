@@ -449,7 +449,11 @@ already in the JSDoc in `gatekeeper.ts`; add anything missing there rather than 
    storage while the producer *was* bound, when every `use` collaborator was verified against
    it or the read was blocked; (iii) the residual is `use` grants created after the unbind,
    who view that persisted state unverified — and re-binding the connection restores their
-   verifiability at their next open.
+   verifiability at their next open. Stale coverage does not ride across the unbind/rebind:
+   `ensureObserver` prunes out-of-scope entries from the observer record at every open, so a
+   `use` collaborator who opened only during the unbound window (verifying nothing against the
+   producer) holds no entry for it, and after the rebind the coverage guard blocks the
+   producer's sensitive reads until each such collaborator re-opens at the restored scope.
    The *never*-bound flavor of the same skip is broader: a producer reachable only through
    chat bindings (an ambient singleton the agent reads in chat) was never in any `use`
    collaborator's scope, so premise (ii) does not hold for it — the agent can persist its

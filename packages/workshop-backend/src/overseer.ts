@@ -4562,8 +4562,11 @@ class OverseerImpl implements AgentHooks {
       // role. The skip also covers a *formerly*-bound producer (unbinding shrinks use scope
       // live) and a *never*-bound one reachable only through chat bindings, whose restricted
       // data the agent may have persisted with no "use" collaborator ever verified against it
-      // -- both accepted residuals; see docs/observers.md edge case 4. An absent role means
-      // "build" (see CollaboratorInfo), which fails safe here.
+      // -- both accepted residuals; see docs/observers.md edge case 4. A rebind after an unbind
+      // is NOT part of the residual: ensureObserver prunes out-of-scope entries at every open,
+      // so a "use" collaborator whose only opens fell in the unbound window holds no entry here
+      // and blocks until they re-open at the restored scope. An absent role means "build" (see
+      // CollaboratorInfo), which fails safe here.
       if (vendorId && (collaborator.role ?? "build") === "use" && !inUseScope) continue;
       let observer = vendorId ? this.storage.observers.get(collaborator.profile.id) : undefined;
       if (!observer || !(gatekeeperId in observer.accountChoices)) {
@@ -8092,14 +8095,36 @@ class OverseerImpl implements AgentHooks {
       clientUser: DurableObjectStub<UserDurableObject>,
       role: CollaboratorRole,
       configureCb?: RpcStub<ObserverConfigCallback>): Promise<void> {
-    // 1. Select in-scope gatekeepers. If none require an account, there is nothing to verify and
-    //    no observer record is needed (built-in gatekeepers never name observers in
-    //    excludeObservers).
+    // 1. Select in-scope gatekeepers. If none require an account, there is nothing to verify
+    //    (built-in gatekeepers never name observers in excludeObservers).
     let inScope = this.#inScopeGatekeepers(role);
+
+    // 2. Load any existing observer record, and prune every account choice for a gatekeeper now
+    //    outside this collaborator's verification scope. This restores the invariant the coverage
+    //    guard (#assertSensitiveObservationCoverage) rests on: entry present => verified at this
+    //    collaborator's most recent open. Without the prune, a "use" collaborator opening while a
+    //    connection is unbound from every gadget verifies nothing against it, yet their stale
+    //    entry survives to be trusted by the guard the moment the connection is rebound (same
+    //    gatekeeper id -- only gadget binding edges changed). The prune must run even when the
+    //    remaining scope is empty -- that's exactly the everything-unbound open. The registration
+    //    itself is left with the gatekeeper (no removeObserver): keeping it preserves forward
+    //    exclusion via byObserverId, and the record stays even if its accountChoices empties,
+    //    since the observerId remains referenced.
+    let record = this.storage.observers.get(profileId);
+    if (record) {
+      let inScopeIds = new Set(inScope.map(gk => gk.id));
+      let pruned = false;
+      for (let key of Object.keys(record.accountChoices)) {
+        if (!inScopeIds.has(Number(key))) {
+          delete record.accountChoices[Number(key)];
+          pruned = true;
+        }
+      }
+      if (pruned) this.storage.observers.put(record);
+    }
     if (inScope.length === 0) return;
 
-    // 2. Load any existing observer record, and build a working copy of its account choices.
-    let record = this.storage.observers.get(profileId);
+    // Build a working copy of the (pruned) account choices.
     let accountChoices: {[gatekeeperId: number]: number} = {...record?.accountChoices};
 
     // Gatekeeper ids whose account choice came from the persisted record (vs. configured during
