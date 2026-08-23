@@ -99,6 +99,49 @@ describe("ensureObserver per-profile serialization", () => {
     });
   });
 
+  it("a failed check's coverage scrub survives a concurrent open", async () => {
+    let stub = env.TEST_OVERSEER.getByName("observer-serialization-scrub");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = (instance as unknown as { impl: any }).impl;
+      seedGatekeepers(impl);
+      // Already-configured coverage for both gatekeepers, as a previous successful open left it.
+      impl.storage.observers.put(
+          { profileId: "alice", observerId: "obs-1", accountChoices: { 1: 10, 2: 20 } });
+
+      // Gatekeeper 1's first re-verification (open A's) parks, then succeeds; its second (open
+      // B's) refuses -- the provider revoked access between the two.
+      let held = deferred();
+      let gk1Calls = 0;
+      impl.getGatekeeperFacet = (id: number) => ({
+        addObserver: async () => {
+          if (id === 1 && ++gk1Calls === 2) throw new Error("access revoked upstream");
+          if (id === 1) await held.promise;
+        },
+        removeObserver: async () => {},
+      });
+
+      let openA = impl.ensureObserver("alice", fakeClientUser, "build");
+      await tick();
+      // B's re-prompt offer is declined, as a client with no way to repair would.
+      let openB = impl.ensureObserver("alice", fakeClientUser, "build", {
+        configure: async () => { throw new Error("cancelled"); },
+      } as any);
+      await tick();
+      held.resolve();
+
+      await expect(openA).resolves.toBeUndefined();
+      await expect(openB).rejects.toThrow();
+
+      // B's failure scrubbed gatekeeper 1 from persisted coverage, and A's success -- which ran
+      // strictly before B under the per-profile lock -- cannot have resurrected it. Without the
+      // lock, A's final put lands after B's scrub and restores coverage the live check just
+      // refused, which the coverage guard would then trust.
+      let record = impl.storage.observers.get("alice");
+      expect(1 in record.accountChoices).toBe(false);
+      expect(record.accountChoices[2]).toBe(20);
+    });
+  });
+
   it("keeps distinct profiles concurrent", async () => {
     let stub = env.TEST_OVERSEER.getByName("observer-serialization-distinct-profiles");
     await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
