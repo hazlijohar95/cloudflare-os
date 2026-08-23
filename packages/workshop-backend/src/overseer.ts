@@ -8072,6 +8072,9 @@ class OverseerImpl implements AgentHooks {
     if (!record) this.#pendingObserverIds.set(observerId, profileId);
     // Gatekeepers we successfully registered the observer with during this call.
     let newlyAdded = new Set<number>();
+    // Gatekeepers that refused (or whose account was gone) during this call -- see fail() below,
+    // which scrubs each from the persisted observer record as the failure is determined.
+    let invalidated = new Set<number>();
 
     // Failures from the previous pass, keyed by gatekeeper id: an already-configured binding whose
     // chosen account was disconnected, or which the gatekeeper refused.
@@ -8162,6 +8165,21 @@ class OverseerImpl implements AgentHooks {
 
           let fail = (reason: string, err?: unknown) => {
             failures.set(gk.id, {accountId, reason});
+            // The coverage guard (#assertSensitiveObservationCoverage) reads the *persisted*
+            // record from other turns, so until this gatekeeper is scrubbed from it, the record
+            // keeps admitting this producer's restricted observations to the collaborator's
+            // still-live sessions -- even though the live check just refused them. Scrub it
+            // synchronously with the failure determination (the record is re-read because the
+            // awaits since load may have let a concurrent open update it; get/put are synchronous
+            // in this single-threaded DO, so nothing lands between the check and the write).
+            // Scoped to the failed gatekeeper: coverage elsewhere stays intact, and a repaired
+            // pass re-persists full coverage at step 6.
+            invalidated.add(gk.id);
+            let persisted = this.storage.observers.get(profileId);
+            if (persisted && gk.id in persisted.accountChoices) {
+              delete persisted.accountChoices[gk.id];
+              this.storage.observers.put(persisted);
+            }
             this.logger.warn("observer verification failed", {
               event: "gatekeeper.observer.verify.failed",
               gatekeeperId: gk.id, vendorId, accountId, observerId, error: err,
@@ -8219,9 +8237,12 @@ class OverseerImpl implements AgentHooks {
       //    the record is the canonical moment the user becomes a configured observer.
       this.storage.observers.put({profileId, observerId, accountChoices});
     } catch (err) {
-      // Best-effort remove all the observers that were newly-added since we didn't persist the
-      // user's observer record.
-      await this.#removeObserverFromGatekeepers(observerId, [...newlyAdded]);
+      // Best-effort deregistration: the newly-added observers were never persisted, and a
+      // gatekeeper that refused this call may still hold a registration from an earlier
+      // successful open (its persisted coverage was already scrubbed in fail(), and
+      // removeObserver is idempotent per the interface contract).
+      await this.#removeObserverFromGatekeepers(
+          observerId, [...new Set([...newlyAdded, ...invalidated])]);
       throw err;
     } finally {
       if (!record) this.#pendingObserverIds.delete(observerId);
