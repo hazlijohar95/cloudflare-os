@@ -174,12 +174,48 @@ describe("ensureObserver per-profile serialization", () => {
 
       // The rejection went through fail(): gatekeeper 1's persisted coverage is scrubbed -- so
       // the coverage guard stops admitting its restricted reads to this collaborator's older
-      // live sessions -- while gatekeeper 2's survives, and the refused registration was torn
-      // down on the gatekeeper.
+      // live sessions -- while gatekeeper 2's survives. The gatekeeper-side registration is
+      // deliberately kept (this was a re-verification of an admitted observer, not a first
+      // open): it preserves forward exclusion for alice's still-live sessions, and the next
+      // successful open's addObserver overwrites it.
       let record = impl.storage.observers.get("alice");
       expect(1 in record.accountChoices).toBe(false);
       expect(record.accountChoices[2]).toBe(20);
-      expect(removed).toEqual([1]);
+      expect(removed).toEqual([]);
+    });
+  });
+
+  it("a failed re-verification keeps an admitted observer's gatekeeper registrations", async () => {
+    let stub = env.TEST_OVERSEER.getByName("observer-serialization-reverify-keeps");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = (instance as unknown as { impl: any }).impl;
+      seedGatekeepers(impl);
+      // Alice was admitted by a previous successful open: her record covers both gatekeepers,
+      // and (implicitly) her sessions may still be live.
+      impl.storage.observers.put(
+          { profileId: "alice", observerId: "obs-1", accountChoices: { 1: 10, 2: 20 } });
+
+      let removed: number[] = [];
+      impl.getGatekeeperFacet = (id: number) => ({
+        addObserver: async () => {
+          if (id === 1) throw new Error("access revoked upstream");
+        },
+        removeObserver: async () => { removed.push(id); },
+      });
+
+      // No repair channel, so gatekeeper 1's refusal is terminal.
+      await expect(impl.ensureObserver("alice", fakeClientUser, "build"))
+          .rejects.toThrow(/could not confirm/);
+
+      // Coverage for the refused gatekeeper is scrubbed (the guard fails closed on its
+      // restricted reads), but the registrations stay put: tearing them down would drop alice
+      // from excludeObservers while her sessions -- which a failed re-verification does not
+      // restart -- keep receiving later non-restricted observations.
+      expect(removed).toEqual([]);
+      let record = impl.storage.observers.get("alice");
+      expect(1 in record.accountChoices).toBe(false);
+      expect(record.accountChoices[2]).toBe(20);
+      expect(record.observerId).toBe("obs-1");
     });
   });
 
@@ -272,12 +308,13 @@ describe("excludeObservers naming a mid-registration observer", () => {
       impl.ownerProfileId = "owner";
 
       let captured: string | undefined;
+      let removed: number[] = [];
       impl.getGatekeeperFacet = (id: number) => ({
         addObserver: async (observerId: string) => {
           captured = observerId;
           if (id === 2) throw new Error("access refused upstream");
         },
-        removeObserver: async () => {},
+        removeObserver: async () => { removed.push(id); },
       });
 
       // The re-prompt offer after gatekeeper 2's refusal is declined, making the failure terminal.
@@ -289,6 +326,13 @@ describe("excludeObservers naming a mid-registration observer", () => {
           return [{ gatekeeperId: 1, accountId: 10 }, { gatekeeperId: 2, accountId: 20 }];
         },
       } as any)).rejects.toThrow();
+
+      // A *first-ever* verification failure rolls back both the accepted registration
+      // (gatekeeper 1, newlyAdded) and the refused one (gatekeeper 2, invalidated): alice was
+      // never admitted, so nothing preserves forward exclusion, and the minted id would linger
+      // unresolvable inside the gatekeepers. This is the boundary of the keep-on-re-verification
+      // rule above, which applies only once a record exists.
+      expect(removed.toSorted()).toEqual([1, 2]);
 
       // The finally cleaned the pending map and no record was persisted, so the id is
       // unresolvable and correctly inert: that collaborator was never admitted.

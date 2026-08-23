@@ -418,10 +418,16 @@ already in the JSDoc in `gatekeeper.ts`; add anything missing there rather than 
 3. **Underlying resource access revoked** — caught at the next open because `addObserver`
    re-runs the live check and throws; the open is denied. Consistent with the lazy-revocation
    model in `sharing.ts`. The denial also scrubs each failed gatekeeper from the collaborator's
-   persisted observer record (and best-effort de-registers them gatekeeper-side), so the
+   persisted observer record, so the
    sensitive-observation coverage guard (edge case 4) blocks that producer's later restricted
    observations — including to the collaborator's still-live sessions — until a successful
-   re-open re-persists coverage, or the collaborator is removed. The residual under the lazy
+   re-open re-persists coverage, or the collaborator is removed. The gatekeeper-side
+   registration is kept on a re-verification failure — it is what preserves forward exclusion
+   (`excludeObservers`) for the collaborator's still-live sessions, it is fail-closed (it can
+   only add exclusion names), and the next successful open's `addObserver` overwrites its
+   verifier; only a *first-ever* verification failure rolls its registrations back, since that
+   collaborator was never admitted and the minted id would otherwise linger unresolvable. The
+   residual under the lazy
    model: a collaborator who never re-opens keeps their record and any live session, but once
    scrubbed they *block* that producer's restricted reads like any unverified collaborator.
    An operational failure (vendor outage, expired credential) scrubs the same way — the

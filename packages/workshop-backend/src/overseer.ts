@@ -8333,12 +8333,22 @@ class OverseerImpl implements AgentHooks {
       //    the record is the canonical moment the user becomes a configured observer.
       this.storage.observers.put({profileId, observerId, accountChoices});
     } catch (err) {
-      // Best-effort deregistration: the newly-added observers were never persisted, and a
-      // gatekeeper that refused this call may still hold a registration from an earlier
-      // successful open (its persisted coverage was already scrubbed in fail(), and
-      // removeObserver is idempotent per the interface contract).
-      await this.#removeObserverFromGatekeepers(
-          observerId, [...new Set([...newlyAdded, ...invalidated])]);
+      // Roll back gatekeeper registrations only for a *first-ever* verification (no persisted
+      // record at call start -- the same discriminator as #pendingObserverIds): that collaborator
+      // was never admitted, has no live session, and once the pending entry is dropped in the
+      // finally their minted id would linger unresolvable inside the gatekeepers. For a
+      // re-verification failure the registrations are deliberately kept: coverage was already
+      // scrubbed synchronously in fail() (so the coverage guard fails closed on restricted
+      // reads), while the registration is what preserves forward exclusion -- byObserverId keeps
+      // resolving the id, so prepareObservation keeps naming this observer in excludeObservers
+      // for their still-live sessions (a failed re-verification does not end sessions; only
+      // scheduleRevocationRestart does). A kept-but-stale registration is fail-closed (it can
+      // only add exclusion names) and self-heals: the next successful open's addObserver
+      // overwrites the verifier.
+      if (!record) {
+        await this.#removeObserverFromGatekeepers(
+            observerId, [...new Set([...newlyAdded, ...invalidated])]);
+      }
       throw err;
     } finally {
       if (!record) this.#pendingObserverIds.delete(observerId);
