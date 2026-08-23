@@ -655,4 +655,57 @@ describe("sensitive observations", () => {
       }
     });
   });
+
+  it.concurrent("ambient reconciliation preserves a shared restricted producer", async () => {
+    await withSession(async publicApi => {
+      const ws = await newWorkspace(publicApi, "ambient-reconcile");
+
+      // Ambient capsule records aren't published to clients, but their workpiece ids are small
+      // sequential integers, so probe for the one ensureAmbientCapsules provisioned at first open.
+      const findAmbientIds = async (overseer: RpcStub<Overseer>) => {
+        const found: number[] = [];
+        for (let id = 0; id < ws.gatekeeperId + 4; id++) {
+          try {
+            const gatekeeper = await overseer.getGatekeeperById(id);
+            if ((await gatekeeper.getTitle()) === "Test Ambient") found.push(id);
+          } catch {
+            // Not a gatekeeper workpiece.
+          }
+        }
+        return found;
+      };
+      const [ambientId] = await findAmbientIds(ws.overseer);
+      expect(ambientId).toBeDefined();
+
+      // Latch through the ambient capsule, so it -- not the pasted connection -- is the producer.
+      const ambient = await ws.overseer.getGatekeeperById(ambientId);
+      const ambientSession: any = await ambient.openSession();
+      await expect(ambientSession.readThing(true)).resolves.toContain("Test Ambient");
+      await addBob(publicApi, ws);
+
+      // Replace the owner's singleton account: disconnecting and re-provisioning mints a new
+      // accountId, so the existing capsule record is stale at the next reconcile.
+      const accounts = await listConnectedAccounts(ws.aliceApi);
+      const oldAccount = accounts.find(a => a.vendorId === TEST_VENDOR_ID)!;
+      await ws.aliceApi.disconnectAccount(oldAccount.id);
+      const newAccount = await provisionAccount(ws.aliceApi);
+      expect(newAccount.id).not.toBe(oldAccount.id);
+
+      // Reopen. Later opens run the capsule reconcile in the background, so wait for the
+      // replacement account's record to appear -- proof the reconcile has run.
+      const overseer2 = await ws.aliceApi.openGadget(ws.gadgetId);
+      await waitFor("the replacement ambient capsule to be provisioned", async () => {
+        const ids = await findAmbientIds(overseer2);
+        return ids.some(id => id !== ambientId) ? true : null;
+      });
+
+      // The stale record anchors Bob's verification, so the reconcile must have skipped it:
+      // the record survives, and sharing -- which refuses once any producer's record is gone --
+      // still works.
+      expect(await findAmbientIds(overseer2)).toContain(ambientId);
+      await expect(overseer2.createShareLink("build", "still shareable")).resolves.toMatchObject({
+        key: expect.any(String),
+      });
+    });
+  });
 });

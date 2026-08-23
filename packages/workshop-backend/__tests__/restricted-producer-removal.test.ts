@@ -165,3 +165,79 @@ describe("removalBlockedByRestrictedData", () => {
     });
   });
 });
+
+// The ambient reconciliation removes a capsule record whose account is gone or was replaced --
+// an internal removal that used to bypass the guard entirely, silently un-anchoring collaborator
+// verification when the stale record was a restricted producer.
+describe("ensureAmbientCapsules reconciliation", () => {
+  const AMBIENT_ID = 1;
+
+  // Seeds a stale ambient producer (record bound to accountId 10, owner now holding accountId
+  // 20) plus the latch, and fakes the owner's User DO and the gatekeeper facet so
+  // ensureAmbientCapsules can run without any real cross-DO call.
+  function seedStaleAmbientProducer(impl: any): void {
+    impl.storage.gatekeepers.put({
+      id: AMBIENT_ID,
+      resourceTitle: "Test Ambient",
+      class: {} as any,
+      creationSpec: { type: "ambient", vendorId: "testvendor", accountId: 10 },
+    });
+    // Keep freshly-provisioned records clear of the seeded id.
+    impl.storage.nextGatekeeperId.put(10);
+    seedRestrictedObservation(impl, AMBIENT_ID, 100);
+    impl.storage.prohibitAllSharing.put(true);
+
+    impl.ownerId = "owner-do-id";
+    impl.users = {
+      idFromString: (id: string) => id,
+      get: () => ({
+        listProvidedAccounts: async () => [{
+          vendorId: "testvendor",
+          accountId: 20,
+          description: { singleton: { tsType: "TestThing" } },
+        }],
+        getSingletonGatekeeperClass: async () => ({} as any),
+      }),
+    };
+    impl.getGatekeeperFacet = () => ({
+      describe: async () => ({ title: "Test Ambient", url: "test://ambient" }),
+    });
+  }
+
+  function ambientRecords(impl: any): { id: number; accountId: number }[] {
+    return [...impl.storage.gatekeepers.list()]
+        .filter((gk: any) => gk.creationSpec?.type === "ambient")
+        .map((gk: any) => ({ id: gk.id, accountId: gk.creationSpec.accountId }));
+  }
+
+  it("keeps a guarded stale producer and still provisions the replacement", async () => {
+    let stub = env.TEST_OVERSEER.getByName("ambient-reconcile-guarded");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedStaleAmbientProducer(impl);
+      seedCollaborator(impl);
+
+      await impl.ensureAmbientCapsules();
+
+      // The stale record anchors the collaborator's verification, so it survives; the
+      // replacement account still gets its own fresh capsule record.
+      let records = ambientRecords(impl);
+      expect(records).toContainEqual({ id: AMBIENT_ID, accountId: 10 });
+      expect(records.filter(r => r.accountId === 20)).toHaveLength(1);
+    });
+  });
+
+  it("still reconciles a stale producer away while the workspace is unshared", async () => {
+    let stub = env.TEST_OVERSEER.getByName("ambient-reconcile-unshared");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedStaleAmbientProducer(impl);
+
+      await impl.ensureAmbientCapsules();
+
+      let records = ambientRecords(impl);
+      expect(records.find(r => r.id === AMBIENT_ID)).toBeUndefined();
+      expect(records.filter(r => r.accountId === 20)).toHaveLength(1);
+    });
+  });
+});

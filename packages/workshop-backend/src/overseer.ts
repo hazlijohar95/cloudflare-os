@@ -6279,6 +6279,18 @@ class OverseerImpl implements AgentHooks {
       if (gk.creationSpec?.type !== "ambient") continue;
       if (currentAccountId.get(gk.creationSpec.vendorId) === gk.creationSpec.accountId) {
         bound.add(gk.creationSpec.vendorId);
+      } else if (await this.removalBlockedByRestrictedData(gk.id)) {
+        // A stale ambient record that anchors restricted-data verification must survive until
+        // the owner unshares -- deleting it here would be the same unchecked readmission
+        // GatekeeperClientImpl.remove() guards against, minus the user intent. Not added to
+        // `bound`, so a replacement account still gets a fresh capsule record;
+        // prepareChatBindings tolerates the duplicate vendor (names dedupe via the fallback
+        // binding name, and the dead record's session just fails).
+        this.logger.warn("skipping removal of stale ambient restricted producer", {
+          event: "singleton.capsules.reconcile.blocked",
+          gatekeeperId: gk.id,
+          vendorId: gk.creationSpec.vendorId,
+        });
       } else {
         this.removeGatekeeper(gk.id);
       }
