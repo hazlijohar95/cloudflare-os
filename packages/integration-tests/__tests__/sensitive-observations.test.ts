@@ -623,6 +623,14 @@ describe("sensitive observations", () => {
       // fresh connection, retried across the abort window.
       await ws.overseer.removeCollaborator(bob.bobProfileId, []);
 
+      // A probe on a fresh connection can only detect a DO that is *already* dead -- never one
+      // about to die -- so a reopen attempted inside the scheduled abort's pre-abort window can
+      // fully succeed against the doomed instance and then lose its session under the
+      // assertions below. First wait for the abort to fell the old instance: this pre-removal
+      // session stub dies with it.
+      await waitFor("the revocation restart to fell the old workspace instance", () =>
+          ws.session.readThing().then(() => null, () => true));
+
       const reopened = await waitFor("the workspace to come back after the revocation restart",
           async () => {
         const publicApi2 = connect(harness.url);
