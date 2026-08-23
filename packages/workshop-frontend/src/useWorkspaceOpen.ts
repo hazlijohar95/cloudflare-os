@@ -11,9 +11,10 @@ import type {
 import { reportIssue } from './errorReporting'
 import { useDocumentTitle } from './useDocumentTitle'
 import {
+  beginRetainedShareKeyWrite,
   clearRetainedShareKey,
+  commitRetainedShareKeyWrite,
   readRetainedShareKey,
-  writeRetainedShareKey,
 } from './retainedShareKeys'
 import {
   classifyWorkspaceOpenFailure,
@@ -115,10 +116,6 @@ export function useWorkspaceOpen({
       }
       if (!hadOpenWorkspace) setError(null)
 
-      // Set by the success path so the capture path's async identity stamp (below) cannot
-      // re-write a retained-key entry this attempt has already discarded.
-      let shareKeyDiscarded = false
-
       try {
         const hash = window.location.hash
         let shareKey = hash.startsWith('#share=') ? hash.slice('#share='.length) : undefined
@@ -128,13 +125,14 @@ export function useWorkspaceOpen({
           // the same stub the open is issued on (useAuth state can be stale across stub swaps).
           // Async so the open itself stays pipelined; not gated on `cancelled`, since the stamp
           // binds the key to whoever captured it regardless of how this attempt ends (a capture
-          // attempt cancelled by a remount must still leave the entry for a later reload). It is
-          // gated on this attempt's success-discard, so a stamp resolving late cannot resurrect
-          // an entry the successful open just retired.
+          // attempt cancelled by a remount must still leave the entry for a later reload). The
+          // write token is what keeps a stamp resolving late from resurrecting an entry that a
+          // success -- any attempt's, not just this one's -- or logout has since cleared.
           const capturedKey = shareKey
+          const write = beginRetainedShareKeyWrite(id)
           authenticatedApi.whoami().then(info => {
-            if (info.type === 'user' && !shareKeyDiscarded) {
-              writeRetainedShareKey(id, { key: capturedKey, userId: info.id })
+            if (info.type === 'user') {
+              commitRetainedShareKeyWrite(write, { key: capturedKey, userId: info.id })
             }
           }).catch(() => {})
           callbacksRef.current.onShareKeyConsumed()
@@ -218,9 +216,8 @@ export function useWorkspaceOpen({
         // both retention tiers -- a *kept* key would silently re-redeem the still-active link
         // after an owner removes this collaborator (the revocation restart reconnects with a
         // new authenticatedApi, re-running this effect while the component stays mounted),
-        // undoing the removal. (`shareKeyDiscarded` keeps the capture path's still-in-flight
-        // identity stamp from re-writing the entry after this.)
-        shareKeyDiscarded = true
+        // undoing the removal. (clearRetainedShareKey also invalidates any still-in-flight
+        // identity stamp, so a late-resolving capture cannot re-write the entry after this.)
         retainedShareKeyRef.current = null
         clearRetainedShareKey(id)
         setError(null)
