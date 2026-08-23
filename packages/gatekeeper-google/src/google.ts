@@ -831,6 +831,8 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 //     hasCalendarFreeBusyAccess covers foreign calendars read by an all-visible availability query.
 //   - BigQuery — strategy C (data-set tracking by dataset): hasDatasetAccess answers whether the
 //     observer's own token has IAM access to a dataset (BigQuery returns 401/403/404 otherwise).
+//     Note the probe is metadata-level, not data-level — see hasDatasetAccess for the accepted
+//     limitation and the tightening direction.
 // The overseer only ever hands this verifier back to a Google gatekeeper, which may therefore trust
 // the boolean results.
 
@@ -916,6 +918,18 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
     }
   }
 
+  /**
+   * KNOWN, ACCEPTED LIMITATION: `datasets.get` succeeding proves only `bigquery.datasets.get` --
+   * dataset *metadata* access (e.g. roles/bigquery.metadataViewer) -- not
+   * `bigquery.tables.getData` on the tables the workspace's queries actually read, nor row-level
+   * security, nor column policy tags. An observer admitted by this probe may therefore see query
+   * *rows* they could not query themselves. The tightening direction is per-table tracking (the
+   * dry-run's `referencedTables` is already in hand at both query call sites;
+   * BigQuerySessionImpl.#datasetsFromReferencedTables currently retains only the dataset
+   * prefixes) plus a table-data probe -- though row-level security and column policy tags are
+   * unprovable through any Google API regardless (row-level security filters rows without ever
+   * denying access).
+   */
   async hasDatasetAccess(projectId: string, datasetId: string): Promise<boolean> {
     let api = new BigQueryApi(opts => this.#getToken(opts));
     try {

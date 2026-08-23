@@ -81,6 +81,12 @@ included). Across all resource types, the gatekeeper can request:
 - `calendar.events` to manage selected calendar and check calendar availability.
 - `bigquery` for BigQuery dry-runs and queries. This is intentionally broader than `bigquery.readonly` because dry-runs use `jobs.insert`; the gatekeeper enforces read-only SQL and resource scope checks before running queries.
 
+For a BigQuery connection, note that collaborator verification currently checks dataset
+**metadata** access (`datasets.get`) for each dataset the workspace has read — not table *data*
+access, and not row-level security or column policy tags. A collaborator admitted as an observer
+may therefore see query results they could not have run themselves. This is a known, accepted
+limitation.
+
 ### Step 4: Test Users
 
 This is important! While your app is in "Testing" mode (which it will be by default), only users you explicitly add here can use OAuth.
