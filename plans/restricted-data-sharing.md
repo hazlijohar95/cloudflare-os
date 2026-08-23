@@ -7,6 +7,14 @@ with a per-collaborator check: a workspace that has read restricted data stays
 shareable, and each collaborator is admitted only while they are verified as an
 observer of the gatekeeper that produced the data.
 
+**Known security limitation:** that guarantee is currently scoped by collaborator role.
+A `use` collaborator is verified only against gatekeepers bound to a gadget. The workspace
+agent can nevertheless read an unbound gatekeeper through a chat binding (including an
+ambient singleton), persist its restricted result into gadget storage or UI state, and
+thereby expose it to an unverified `use` collaborator. This plan accepts that risk for the
+current implementation; "Never-bound producers" below records the exact boundary and the
+required future remedies.
+
 Delivered as **one PR, split into reviewable commits** (see "Commit sequence" at the
 end). The kernel packages (`workshop-backend`, `workshop-shared`) get the small,
 separated diffs; the rename, the UI, and the frontend share-key work ride in their own
@@ -33,13 +41,16 @@ commits.
 - **Admission is per-collaborator, checked continuously.** Not at grant time: at every
   `open()`, so revocation of a collaborator's underlying resource access is caught
   promptly. `authorizeObservation` admits a restricted observation only when every
-  current collaborator is already verified against the producing gatekeeper
-  (`#assertSensitiveObservationCoverage`).
+  current collaborator in whose role scope the producer falls is already verified
+  against it (`#assertSensitiveObservationCoverage`). The exception for an unbound
+  producer and a `use` collaborator is the known security risk stated above.
 - **Coverage is held to each collaborator's own role scope.** `ensureObserver` never
   verifies a `use` collaborator against a gatekeeper no gadget binds, so demanding
   coverage there would block the read permanently and make the error's remedy ("re-open
-  the workspace") a lie. An unverifiable gatekeeper — no vendor account, or a legacy
-  record with no `creationSpec` — blocks on any collaborator regardless of role.
+  the workspace") a lie. This is a liveness tradeoff, not a security guarantee: restricted
+  data can flow from that gatekeeper through the agent into gadget-visible state. An
+  unverifiable gatekeeper — no vendor account, or a legacy record with no `creationSpec`
+  — blocks on any collaborator regardless of role.
 - **Share-key redemption becomes two-phase.** A redeemed edge is written *pending*: it
   grants nothing to anyone and is invisible to `listCollaborators`. Only the open that
   is verifying it counts it, via an explicit `assumePendingLink` opt-in. Success
@@ -108,6 +119,10 @@ marked pending.
 Resolves the effective role — counting the pending edge when settling one — denies below
 `requireRole` *before* verification runs, then calls `ensureObserver`.
 
+The base fixes PR introduces this gate (the role floor plus the `ensureObserver` call)
+with `receiveExternalMessage` as its only caller; this PR extends it with the
+pending-redemption machinery below and migrates `open()` onto it.
+
 Denying early matters: without it a `use` collaborator reaching `receiveExternalMessage`
 would be verified (real `addObserver` calls, a persisted record) only to be turned away,
 or worse, told to fix a verification failure that could never grant them access.
@@ -139,6 +154,16 @@ terminal catch de-registers invalidated gatekeepers alongside newly-added ones
 (`removeObserver` is idempotent). The scrub is scoped to the failed gatekeeper; a
 repaired pass re-persists full coverage.
 
+`ensureObserver` is serialized per profile (a promise chain, like
+`#preparingChatMessages` -- `blockConcurrencyWhile` would freeze the DO across the
+unbounded modal wait). Its body loads the observer record, awaits verifier RPCs and the
+modal, and persists at the end; input gates don't cover those awaits, so without the
+lock a concurrent open's final put resurrected coverage a failed check had just
+scrubbed, and two concurrent first opens each minted their own `observerId`, orphaning
+the loser's id inside the gatekeepers. One consequence: `authorizeCollaborator`
+snapshots its scope fingerprint before queueing, so a queued open's snapshot is older
+than its verification -- which fails closed (it can only deny more).
+
 ### 6. Frontend
 
 - **Share modal**: no longer replaces itself with a "can't be shared" view. Controls stay
@@ -152,36 +177,65 @@ repaired pass re-persists full coverage.
   sweeps it, and `logout()` sweeps the whole prefix including malformed and older
   unstamped entries. Without this, one user's pending share key could be auto-redeemed
   under the next user's account in the same tab.
+- **The in-memory tier is bound to its capturing stub**: it is replayed only on the same
+  `authenticatedApi` that captured it; any other stub falls through to the
+  identity-checked storage tier. This removes the reliance on the rendering invariant
+  that an identity change unmounts the editor -- true today, but enforced two files away.
+- **Stamps are generation-gated**: the async identity stamp commits through a write token
+  taken at capture; clearing a workspace's entry (a successful open) or the logout sweep
+  voids every earlier token, so a stamp resolving late cannot resurrect a cleared key.
+  The invalidation lives in `retainedShareKeys.ts` because the storage outlives any one
+  attempt -- a per-attempt flag guards only its own attempt's writes.
+- **A superseded open bails after its identity await**, before creating any capability:
+  its cleanup already ran with nothing to dispose, so proceeding would mint a stub
+  nothing can reach and publish a stale (or wrong-workspace) capability.
 
 ## Commit sequence (one PR)
 
 Ordered so the kernel-critical diffs are isolated. Every commit type-checks green across
 `workshop-shared`, `workshop-backend`, `workshop-frontend` and `gatekeeper-google`.
 
-1. **Bugfix — external-message observer verification.** Pre-existing and independent of
-   everything below: verification only ever ran in `open()`, so
-   `receiveExternalMessage` authorized on the effective role alone. Adds an inline
-   `ensureObserver` call. Cherry-pickable onto main on its own.
-2. **Refactor — the rename.** Mechanical, no behavior change, spanning
+Two pre-existing bugs this work surfaced ship as their own PR, based directly on main
+and sitting below this one in the stack, since both are live on main today and neither
+depends on the model change: **verify collaborators on the external-message path**
+(verification only ever ran in `open()`, so `receiveExternalMessage` authorized on the
+effective role alone) and **serialize observer verification per profile** (§5). The
+first fix lands as the `authorizeCollaborator` gate itself (§3), which this PR then
+extends; the fixes PR also carries the external-message integration coverage — the
+harness's gateway bindings, the fixture's real sessions, and the two tests that
+exercise base behavior (verification on the external path, and its role-before-
+verification denial) — that Part 4 here builds on.
+
+1. **Refactor — the rename.** Mechanical, no behavior change, spanning
    `workshop-shared`, `workshop-backend`, `workshop-frontend`, `gatekeeper-google`,
    `gatekeeper-mcp` and the gatekeeper-authoring skill doc. Atomic by necessity.
-3. **Part 1 — API.** `PermissionEdge.pending`; the restated contract on
+2. **Part 1 — API.** `PermissionEdge.pending`; the restated contract on
    `containsRestrictedData`. Server still implements the old behavior.
-4. **Part 2 — core server implementation.** The coverage guard, `authorizeCollaborator`,
+3. **Part 2 — core server implementation.** The coverage guard, `authorizeCollaborator`,
    the pending-edge trio, `restrictedProducerIds`/`assertNewSharingAllowed`, the
-   producer-removal guard, the legacy flag shim, and removal of `hasAnyShares`. Commit
-   1's inline call folds into `authorizeCollaborator` here.
-5. **Part 3 — backend tests.**
-6. **Part 4 — integration tests.** Over real Durable Objects; the test gatekeeper fixture
-   grows a per-resource restricted flag and a controllable verification outcome.
-7. **Part 5 — UI changes.** The Share modal notice.
-8. **Part 6 — documentation.** `docs/observers.md` coverage rules and residuals;
+   producer-removal guard, the legacy flag shim, and removal of `hasAnyShares`. Extends
+   the `authorizeCollaborator` gate the fixes PR introduced (pending-edge role
+   computation, the scope fingerprint, the confirm and role re-derivation) and migrates
+   `open()` onto it.
+4. **Part 3 — backend tests.**
+5. **Part 4 — integration tests.** Over real Durable Objects; the test gatekeeper fixture
+   grows a per-resource restricted flag and a controllable verification outcome. The
+   external-message gate's base-behavior tests live in the fixes PR
+   (`external-message-verification.test.ts`); this commit adds the restricted-data
+   scenarios on top.
+6. **Part 5 — UI changes.** The Share modal notice.
+7. **Part 6 — documentation.** `docs/observers.md` coverage rules and residuals;
    `docs/sharing.md` pending redemption.
-9. **Bugfix — scrub persisted coverage on a failed live check** (§5).
-10. **Bugfix — re-assert the redemption policy at `confirmShareKeyRedemption`.**
-11. **Comment-only — document the pending-edge re-add wart** (below).
-12. **Retain a consumed share key so a failed open can retry.**
-13. **Bugfix — identity-key retained share keys and clear them on logout.**
+8. **Bugfix — scrub persisted coverage on a failed live check** (§5).
+9. **Bugfix — re-assert the redemption policy at `confirmShareKeyRedemption`.**
+10. **Comment-only — document the pending-edge re-add wart** (below).
+11. **Retain a consumed share key so a failed open can retry.**
+12. **Bugfix — identity-key retained share keys and clear them on logout.**
+13. **Bugfix — abandon a superseded workspace open before it creates a capability** (§6).
+14. **Bugfix — bind the retained share key to the session that captured it** (§6).
+15. **Bugfix — invalidate a pending share-key stamp on discard and logout** (§6).
+16. **Cover the observer-coverage scrub against a concurrent open** — the §5 lock and
+    scrub compose; asserted once both exist.
 
 ## Known edge cases / watch-fors
 
@@ -211,6 +265,17 @@ Ordered so the kernel-critical diffs are isolated. Every commit type-checks gree
 - **Role increases do not ride out on a redeeming open.** An owner grant landing while
   verification waited takes effect at the recipient's next open, exactly as for an
   ordinary keyless open.
+- **Open gap, NOT implemented in this PR — removing an unverifiable restricted producer
+  unblocks its collaborators.** `remove()`'s producer guard exempts unverifiable records
+  ("removing one is itself a remedy"), which is backwards once the data has been read:
+  the record is the *blocker* -- `#inScopeGatekeepers` throws on it, so no collaborator
+  can open -- and removing it lets every existing collaborator open unverified while the
+  restricted data persists in chat history, gadget storage and code.
+  `assertNewSharingAllowed` only stops *new* grants. Decided remedy, for a follow-up:
+  guard unverifiable producers like any other -- the owner must remove all collaborators
+  and revoke all share links before removal, after which the workspace is permanently
+  owner-only (`restrictedProducerIds()` reads the action log, which never forgets the
+  producer). Fail-closed and preferable to exposing data nothing can verify anymore.
 
 ## Accepted tradeoffs / future work
 
@@ -220,13 +285,18 @@ Ordered so the kernel-critical diffs are isolated. Every commit type-checks gree
   the data entered gadget storage while the producer *was* bound, when every `use`
   collaborator was verified or the read was blocked; and re-binding restores
   verifiability at the next open. The residual is `use` grants created after the unbind.
-- **Never-bound producers.** Broader: a producer reachable only through chat bindings (an
-  ambient singleton the agent reads) was never in any `use` collaborator's scope, so the
-  premise above does not hold — the agent can persist its restricted data with no `use`
-  collaborator ever verified against it, and there is no prior binding to restore.
-  Accepted on the grounds that coverage there is unverifiable by construction, exposure
-  is limited to what the agent chose to persist, and the forward remedy is binding the
-  producer to a gadget. Both residuals are documented at `docs/observers.md` edge case 4.
+- **Known security risk — never-bound producers.** A producer reachable only through chat
+  bindings (including an ambient singleton) is never in a `use` collaborator's verification
+  scope. The agent can read restricted data from it, persist the result into gadget code,
+  storage, or UI state, and the collaborator can then read that state through the deployed
+  gadget despite never passing the producer's `addObserver()` check. The coverage guard
+  deliberately skips this collaborator, so `containsRestrictedData` does not prevent this
+  disclosure. Binding the producer makes future opens verifiable but does not retract data
+  already exposed. Accepted temporarily to avoid making the read permanently unavailable
+  under the current role-scoped model. The required fix is either workspace-wide observer
+  verification for `use` collaborators or enforceable provenance that prevents data from an
+  unverified producer reaching their gadget-visible state. Both this and the formerly-bound
+  residual are documented at `docs/observers.md` edge case 4.
 - **`calculate()`-style aggregates are out of scope here.** This plan governs *who* may
   see restricted data, not what an aggregate over it discloses.
 - **The coverage guard is O(collaborators) per restricted observation**, reading one
