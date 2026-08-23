@@ -4630,23 +4630,45 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Refuse a new sharing grant once the workspace has read restricted data through a connection
-  // that no longer exists. A new collaborator's verification anchors on the producer connection's
-  // record (ensureObserver and the coverage guard); with the record gone there is nothing to
-  // verify them against, while the restricted data persists in chat history and storage. Grants
-  // that predate the removal are untouched -- this guards only new ones, which includes share-key
-  // *redemption* (open() passes this as redeemShareKey's assertGrantAllowed), so outstanding keys
-  // die with the producer rather than staying redeemable. Removing a producer already requires
-  // zero collaborators and zero share links (see removalBlockedByRestrictedData), so this bites
-  // after a producer was removed while the workspace was unshared (or removed before that guard
-  // covered unverifiable producers).
+  // that no longer exists -- or one that exists but can never verify a collaborator. A new
+  // collaborator's verification anchors on the producer connection's record (ensureObserver and
+  // the coverage guard); with the record gone, legacy (no creationSpec), or backed by no vendor
+  // account (aiModel/agentSpawner) there is nothing to verify them against, while the restricted
+  // data persists in chat history and storage. Grants that predate the removal are untouched --
+  // this guards only new ones, which includes share-key *redemption* (open() passes this as
+  // redeemShareKey's assertGrantAllowed), so outstanding keys die with the producer rather than
+  // staying redeemable. Removing a producer already requires zero collaborators and zero share
+  // links (see removalBlockedByRestrictedData), so the missing-record branch bites after a
+  // producer was removed while the workspace was unshared (or removed before that guard covered
+  // unverifiable producers).
   assertNewSharingAllowed(): void {
     if (!this.storage.prohibitAllSharing.get()) return;
     for (let id of this.restrictedProducerIds()) {
-      if (!this.storage.gatekeepers.get(id)) {
+      let producer = this.storage.gatekeepers.get(id);
+      if (!producer) {
         throw new Error(
             "This workspace can no longer be shared: it read sensitive data through a connection " +
             "that has since been removed, so new collaborators can no longer be verified for " +
             "access to that data.");
+      }
+      // A producer that exists but can never verify a collaborator refuses the same way. Two
+      // flavors (resolved exactly as the coverage guard does): a legacy record with no
+      // creationSpec (observerVendorId throws), where the grant would succeed only for recipients
+      // to hard-deny at open (#inScopeGatekeepers throws) while the grant itself blocks producer
+      // removal; and an aiModel/agentSpawner producer (vendorId null), which is filtered out of
+      // every verification scope, so recipients would open completely unverified and read the
+      // restricted history in chat. No removal remedy is offered: after removing the producer,
+      // the missing-record branch above throws anyway.
+      let vendorId: string | null = null;
+      try {
+        vendorId = observerVendorId(producer);
+      } catch {
+        // Legacy connection with no creationSpec: treat as unverifiable.
+      }
+      if (vendorId === null) {
+        throw new Error(
+            "This workspace can no longer be shared: it read sensitive data through a connection " +
+            "that cannot verify collaborators' access to that data.");
       }
     }
   }

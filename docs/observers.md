@@ -500,17 +500,22 @@ already in the JSDoc in `gatekeeper.ts`; add anything missing there rather than 
    of a legacy record is impossible — it never persisted the vendor identity, and the class
    stub is opaque — so the documented recovery for an owner who wants to share such a workspace
    is to start a new one. (The other unverifiable flavor — aiModel/agentSpawner, no vendor
-   account — widens nothing on removal: it was never in any collaborator's verification scope,
-   and its sensitive reads were coverage-blocked whenever anyone was shared in; it is guarded
-   anyway, uniformly.) Internal removals: the creation-failure rollback is unguarded (a
+   account — is guarded uniformly too. Removal widens little for it — it was never in any
+   collaborator's verification scope, and its sensitive reads were coverage-blocked whenever
+   anyone was shared in — but restricted history *predating* the share did leak to recipients
+   until `assertNewSharingAllowed` below started refusing unverifiable producers: new grants
+   were the only unguarded gate, since the coverage guard protects only new observations.)
+   Internal removals: the creation-failure rollback is unguarded (a
    just-created record cannot be a producer), and the ambient reconciliation
    (`ensureAmbientCapsules`) skips — and logs — a stale record the guard protects, so a
    disconnected or replaced ambient account's producer record survives until the owner
    unshares (the replacement account still gets its own fresh record).
    The complementary rule: once latched, if any producer connection no longer exists (removed
    while the workspace was unshared, or removed before the guard covered unverifiable
-   producers), a new party could no longer be verified for the data, so everything that would
-   admit one refuses (`assertNewSharingAllowed`): the grant-creating sharing mutators —
+   producers) — or exists but can never verify a collaborator (a legacy record, or an
+   aiModel/agentSpawner producer with no vendor account behind it) — a new party could not be
+   verified for the data, so everything that would admit one refuses
+   (`assertNewSharingAllowed`): the grant-creating sharing mutators —
    `addCollaborator`, `createShareLink`, `newShareLinkKey` — and `redeemShareKey` at open().
    Gating redemption is defense-in-depth now that removal itself refuses while links are
    outstanding: once any producer is gone anyway, those keys are dead too — refused before a

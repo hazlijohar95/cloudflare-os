@@ -241,3 +241,79 @@ describe("ensureAmbientCapsules reconciliation", () => {
     });
   });
 });
+
+// assertNewSharingAllowed() must refuse every new grant once a restricted producer cannot verify
+// collaborators -- whether its record is gone, is legacy (no creationSpec; observerVendorId
+// throws, so recipients hard-deny at open while the grant blocks producer removal), or is an
+// aiModel/agentSpawner producer with no vendor account (filtered out of every verification scope,
+// so recipients would open completely unverified and read the restricted history in chat).
+describe("assertNewSharingAllowed", () => {
+  it("allows sharing while a verifiable producer's record survives", async () => {
+    let stub = env.TEST_OVERSEER.getByName("sharing-allowed-verifiable");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedGatekeeper(impl, 1);
+      seedRestrictedObservation(impl, 1, 100);
+      impl.storage.prohibitAllSharing.put(true);
+
+      expect(() => impl.assertNewSharingAllowed()).not.toThrow();
+    });
+  });
+
+  it("refuses when a producer's record has been removed", async () => {
+    let stub = env.TEST_OVERSEER.getByName("sharing-allowed-removed");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedRestrictedObservation(impl, 1, 100);
+      impl.storage.prohibitAllSharing.put(true);
+
+      expect(() => impl.assertNewSharingAllowed()).toThrow(/has since been removed/);
+    });
+  });
+
+  it("refuses a legacy producer that cannot verify collaborators", async () => {
+    let stub = env.TEST_OVERSEER.getByName("sharing-allowed-legacy");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedGatekeeper(impl, 1, /* creationSpec */ false);
+      seedRestrictedObservation(impl, 1, 100);
+      impl.storage.prohibitAllSharing.put(true);
+
+      expect(() => impl.assertNewSharingAllowed()).toThrow(/cannot verify collaborators/);
+    });
+  });
+
+  it("refuses an aiModel producer that cannot verify collaborators", async () => {
+    let stub = env.TEST_OVERSEER.getByName("sharing-allowed-ai-model");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      impl.storage.gatekeepers.put({
+        id: 1,
+        resourceTitle: "AI model",
+        class: {} as any,
+        creationSpec: {
+          type: "aiModel", modelId: "m-1", provider: "anthropic", modelName: "claude-sonnet-5",
+        },
+      });
+      seedRestrictedObservation(impl, 1, 100);
+      impl.storage.prohibitAllSharing.put(true);
+
+      // No vendor account stands behind the producer (observerVendorId returns null), so no
+      // recipient could ever be verified against it -- pre-fix this grant went through and
+      // recipients read the restricted history unverified.
+      expect(() => impl.assertNewSharingAllowed()).toThrow(/cannot verify collaborators/);
+    });
+  });
+
+  it("never refuses while the workspace is unlatched", async () => {
+    let stub = env.TEST_OVERSEER.getByName("sharing-allowed-unlatched");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      // Even a restricted-looking observation through a missing record does not refuse without
+      // the latch: the latch and the record are written together, so unlatched means none.
+      seedRestrictedObservation(impl, 1, 100);
+
+      expect(() => impl.assertNewSharingAllowed()).not.toThrow();
+    });
+  });
+});
