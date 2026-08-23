@@ -224,8 +224,9 @@ export class TestVerifier
  * A live session against a Test Thing, opened via `GatekeeperClient.openSession()`.
  *
  * The two methods exist so tests can drive the overseer's observation/action policy through the
- * same `ApprovalQueue` funnel a shipping gatekeeper uses: `readThing()` records an observation,
- * and `doThing()` submits an action.
+ * same `ApprovalQueue` funnel a shipping gatekeeper uses: `readThing()` records an observation
+ * (optionally marked `containsRestrictedData`, to trip the sensitive-data coverage guard and the
+ * restricted-mode latch), and `doThing()` submits an action (which restricted mode blocks).
  */
 export class TestSession extends RpcTarget {
   #queue: RpcStub<ApprovalQueue>;
@@ -237,10 +238,11 @@ export class TestSession extends RpcTarget {
     this.#title = title;
   }
 
-  async readThing(): Promise<string> {
+  async readThing(restricted?: boolean): Promise<string> {
     await this.#queue.authorizeObservation({
       title: `Read ${this.#title}`,
       description: `The test read ${this.#title}.`,
+      ...(restricted ? { containsRestrictedData: true } : {}),
     });
     return `the contents of ${this.#title}`;
   }
