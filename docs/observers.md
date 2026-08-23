@@ -532,7 +532,11 @@ already in the JSDoc in `gatekeeper.ts`; add anything missing there rather than 
    (`confirmShareKeyRedemption`, the granting write) — the two are separated by the redeeming
    open()'s await windows, so a producer removed anywhere between redemption and confirm still
    refuses the grant. Existing grants are untouched: a *confirmed* edge skips both checks, so a
-   collaborator re-opening with a retained key stays a no-op.
+   collaborator re-opening with a retained key stays a no-op. Concurrent redemptions of one link
+   share a single pending edge, on which each open() holds its own claim
+   (`PermissionEdge.pendingAttempts`): a failed open's revert withdraws only its own claim and
+   severs the edge only when none remain, so it cannot yank the edge out from under a sibling
+   still mid-verification; a confirm clears every claim along with the pending flag.
 
 ---
 

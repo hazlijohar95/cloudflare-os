@@ -230,16 +230,21 @@ export class SharingManager {
    *
    * Returns the redeemed link's id when there is now a pending edge for the caller to settle --
    * whether this call added it, or a concurrent (or crashed) redemption of the same link left one
-   * mid-verification; each such open verifies and confirms/reverts independently. Returns null
-   * when the call changed nothing: an unknown or revoked key, or an already-*confirmed* edge for
-   * this link (redeeming a second key of the same link is a no-op).
+   * mid-verification; each such open verifies and confirms/reverts independently -- along with a
+   * fresh `attemptId`, this call's own claim on the shared pending edge (recorded in its
+   * `pendingAttempts`). The caller passes the attemptId to `revertShareKeyRedemption` so a
+   * failure withdraws only its own claim; `confirmShareKeyRedemption` clears every claim. A
+   * crashed open()'s stale claim can leave a pending edge lingering -- harmless: pending edges
+   * grant nothing, adoption keeps working, and the next successful confirm clears everything.
+   * Returns null when the call changed nothing: an unknown or revoked key, or an
+   * already-*confirmed* edge for this link (redeeming a second key of the same link is a no-op).
    */
   async redeemShareKey(opts: {
     rawKey: string;
     profileId: string;
     fetchProfile: () => Promise<AiChatAuthorInfo>;
     assertGrantAllowed?: () => void;
-  }): Promise<string | null> {
+  }): Promise<{ linkId: string; attemptId: string } | null> {
     let hash = await hashShareKey(opts.rawKey);
     let keyRecord = this.storage.shareKeys.get(hash);
     if (!keyRecord) return null;
@@ -266,14 +271,17 @@ export class SharingManager {
 
     // A confirmed edge for this link means a prior redemption fully succeeded, so there is
     // nothing to settle (and no new grant, so no policy check). A still-pending one means another
-    // redemption of this link is mid-verification (or crashed): leave it untouched and let this
-    // attempt verify and confirm/revert it independently -- but settling it would complete a new
-    // grant, so it is policy-gated like writing one.
+    // redemption of this link is mid-verification (or crashed): adopt it by adding this attempt's
+    // own claim and let this attempt verify and confirm/revert independently -- but settling it
+    // would complete a new grant, so it is policy-gated like writing one.
+    let attemptId = crypto.randomUUID();
     for (let edge of existing.addedBy) {
       if (edge.type === "shareKey" && edge.keyId === linkId) {
         if (!edge.pending) return null;
         opts.assertGrantAllowed?.();
-        return linkId;
+        (edge.pendingAttempts ??= []).push(attemptId);
+        this.storage.collaborators.put(existing);
+        return { linkId, attemptId };
       }
     }
     opts.assertGrantAllowed?.();
@@ -283,9 +291,10 @@ export class SharingManager {
       created: new Date(),
       role,
       pending: true,
+      pendingAttempts: [attemptId],
     });
     this.storage.collaborators.put(existing);
-    return linkId;
+    return { linkId, attemptId };
   }
 
   /**
@@ -331,6 +340,10 @@ export class SharingManager {
         if (edge.pending) {
           assertGrantAllowed?.();
           delete edge.pending;
+          // A real grant supersedes every outstanding claim: a sibling attempt's later revert
+          // must not disturb the confirmed edge (revert only touches pending ones anyway), and a
+          // confirmed edge must not carry redemption bookkeeping.
+          delete edge.pendingAttempts;
           this.storage.collaborators.put(record);
         }
         return;
@@ -347,17 +360,31 @@ export class SharingManager {
   }
 
   /**
-   * Sever the still-pending `shareKey` edge a just-completed `redeemShareKey` added, restoring
-   * the graph to its pre-redemption state. Used when the redeeming user is refused *after*
-   * redemption, so a refused recipient never persists in the sharing graph. They can redeem the
-   * same key again once whatever refused them is fixed. An edge a concurrent open of the same
-   * link already *confirmed* is left alone -- that open verified this user, and its grant must
-   * survive this attempt's failure. Lazy like removeCollaborator: the collaborator record itself
-   * is retained, even if now edge-less.
+   * Withdraw one attempt's claim on the still-pending `shareKey` edge its `redeemShareKey` added
+   * or adopted, severing the edge only once no claims remain. Used when the redeeming user is
+   * refused *after* redemption, so a refused recipient never persists in the sharing graph; they
+   * can redeem the same key again once whatever refused them is fixed. Concurrent redemptions of
+   * one link share the single pending edge, so the sever is claim-counted: a failed attempt must
+   * not yank the edge out from under a sibling still mid-verification -- the sibling would see a
+   * transient denial, or its confirm's missing-edge re-add would write the link's full role
+   * rather than the narrower role it verified. An absent claims array is treated as empty and
+   * severs (defensive; every pending edge is written with its claims). An edge a concurrent open
+   * of the same link already *confirmed* is left alone -- that open verified this user, and its
+   * grant must survive this attempt's failure. Lazy like removeCollaborator: the collaborator
+   * record itself is retained, even if now edge-less.
    */
-  revertShareKeyRedemption(profileId: string, linkId: string): void {
+  revertShareKeyRedemption(profileId: string, linkId: string, attemptId: string): void {
     let record = this.storage.collaborators.get(profileId);
     if (!record) return;
+    for (let edge of record.addedBy) {
+      if (edge.type === "shareKey" && edge.keyId === linkId && edge.pending) {
+        edge.pendingAttempts = (edge.pendingAttempts ?? []).filter(id => id !== attemptId);
+        if (edge.pendingAttempts.length > 0) {
+          this.storage.collaborators.put(record);
+          return;
+        }
+      }
+    }
     record.addedBy = record.addedBy.filter(
         e => !(e.type === "shareKey" && e.keyId === linkId && e.pending));
     this.storage.collaborators.put(record);

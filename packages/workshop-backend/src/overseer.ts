@@ -8716,10 +8716,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       // appear in the collaborators table. Redemption adds only a *pending* edge, which grants
       // nothing to anyone until observer verification below confirms it; the redeemed link id is
       // kept so authorizeCollaborator can verify against the hypothetical grant and confirm it on
-      // success, and so a refusal severs the still-pending edge.
-      let redeemedLinkId: string | null = null;
+      // success, and the attemptId -- this open's own claim on the (possibly shared) pending edge
+      // -- so a refusal withdraws exactly this open's claim.
+      let redemption: { linkId: string; attemptId: string } | null = null;
       if (shareKey) {
-        redeemedLinkId = await sharing.redeemShareKey({
+        redemption = await sharing.redeemShareKey({
           rawKey: shareKey,
           profileId,
           fetchProfile: () => clientUser.whoami(),
@@ -8749,28 +8750,30 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       try {
         effectiveRole = await this.impl.authorizeCollaborator(
             profileId, clientUser,
-            {configureCb: configureObservers, pendingLinkId: redeemedLinkId ?? undefined});
+            {configureCb: configureObservers, pendingLinkId: redemption?.linkId});
       } catch (err) {
-        // Verification refused the caller. If this open() had just redeemed a share key, sever
-        // the still-pending edge it added, so a refused recipient never persists in the sharing
-        // graph. (An edge a concurrent open of the same link already confirmed is left alone.)
+        // Verification refused the caller. If this open() had just redeemed a share key,
+        // withdraw its own claim on the pending edge -- severing the edge only when no
+        // concurrent redemption of the same link still holds one -- so a refused recipient
+        // never persists in the sharing graph, while a sibling still mid-verification keeps the
+        // edge it is settling. (An edge a concurrent open already confirmed is left alone.)
         // They can redeem the same key again once their access is fixed. (The revert persists
         // despite the rethrow: DO storage is not rolled back when an RPC throws.)
-        if (redeemedLinkId) {
-          sharing.revertShareKeyRedemption(profileId, redeemedLinkId);
+        if (redemption) {
+          sharing.revertShareKeyRedemption(profileId, redemption.linkId, redemption.attemptId);
         }
         throw err;
       }
       if (!effectiveRole) {
         // A null role means the redeemed link's creator is currently unreachable in the
         // permission graph -- or the link itself was revoked while verification was in flight
-        // (authorizeCollaborator re-derives the role after confirming the edge). Sever any
-        // still-pending edge here too: otherwise the recipient persists as an inert collaborator
+        // (authorizeCollaborator re-derives the role after confirming the edge). Withdraw this
+        // open's claim here too: otherwise the recipient persists as an inert collaborator
         // who springs back -- unverified -- if the creator regains access. In the revoked-link
         // case the edge was already confirmed, so this is a no-op and the confirmed edge lingers
         // inert (lazy model).
-        if (redeemedLinkId) {
-          sharing.revertShareKeyRedemption(profileId, redeemedLinkId);
+        if (redemption) {
+          sharing.revertShareKeyRedemption(profileId, redemption.linkId, redemption.attemptId);
         }
         throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceAccessDenied);
       }
