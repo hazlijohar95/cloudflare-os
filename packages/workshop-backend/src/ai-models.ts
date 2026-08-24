@@ -134,6 +134,9 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
     case "cerebras": return undefined;
+    case "deepseek": return undefined;
+    case "groq": return undefined;
+    case "openrouter": return undefined;
     case "ollama": return undefined;
     default: return undefined;
   }
@@ -245,21 +248,30 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         compat: workersAiCompat(catalog),
       };
     case "cerebras":
-      // Cerebras is an OpenAI-compatible provider served by the gateway's `cerebras` passthrough.
-      // Not in pi's builtin catalog, so every field is synthesized. supportsDeveloperRole is off:
-      // Cerebras' chat API takes the classic `system` role, not OpenAI's newer `developer` role.
+    case "deepseek":
+    case "groq":
+    case "openrouter": {
+      // OpenAI-compatible providers served by the gateway's per-provider passthrough. pi appends
+      // `/chat/completions` to baseUrl, and these providers expose that directly under their
+      // gateway path -- except OpenRouter, whose passthrough keeps upstream's `/v1` segment (see
+      // each provider's AI Gateway doc page). None are in pi's builtin catalog, so every field is
+      // synthesized. supportsDeveloperRole is off: these APIs take the classic `system` role, not
+      // OpenAI's newer `developer` role.
+      const suffix = config.provider === "openrouter" ? "/v1" : "";
       return {
         id: config.model,
         name: catalog?.name ?? config.model,
         api: "openai-completions",
-        provider: "cerebras",
-        baseUrl: `${gatewayUrl}/cerebras/v1`,
-        reasoning: false,
+        provider: config.provider,
+        baseUrl: `${gatewayUrl}/${config.provider}${suffix}`,
+        // DeepSeek V4 defaults to thinking mode; the others' listed models do not reason.
+        reasoning: config.provider === "deepseek",
         input: ["text"],
         cost: ZERO_COST,
         ...window,
         compat: { supportsDeveloperRole: false },
       };
+    }
     default:
       return undefined;
   }
@@ -570,16 +582,27 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
       });
     }
     case "cerebras":
-      // Direct Cerebras access (no AI Gateway): OpenAI-compatible endpoint, key from the config.
+    case "deepseek":
+    case "groq":
+    case "openrouter": {
+      // Direct access (no AI Gateway): each provider's own OpenAI-compatible endpoint, key from
+      // the config. Accepts and strips a trailing /v1 so a pasted full endpoint works too.
+      const defaultBase = {
+        cerebras: "https://api.cerebras.ai/v1",
+        deepseek: "https://api.deepseek.com/v1",
+        groq: "https://api.groq.com/openai/v1",
+        openrouter: "https://openrouter.ai/api/v1",
+      }[config.provider];
       return makeHandle({
         model: {
           id: config.model,
           name: config.model,
           api: "openai-completions",
-          provider: "cerebras",
-          baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "https://api.cerebras.ai")
-              .replace(/\/v1$/, "")}/v1`,
-          reasoning: false,
+          provider: config.provider,
+          baseUrl: config.apiUrl
+              ? `${stripTrailingSlashes(config.apiUrl).replace(/\/v1$/, "")}/v1`
+              : defaultBase,
+          reasoning: config.provider === "deepseek",
           input: ["text"],
           cost: ZERO_COST,
           ...window,
@@ -588,6 +611,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         apiKey: config.apiToken,
         sessionAffinity,
       });
+    }
     case "google":
       return makeHandle({
         model: {

@@ -22,6 +22,9 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
   cerebras: 'Cerebras',
+  deepseek: 'DeepSeek',
+  groq: 'Groq',
+  openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }
 
@@ -32,6 +35,9 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   google: 'AIza...',
   cloudflare: 'Cloudflare API token',
   cerebras: 'csk-...',
+  deepseek: 'sk-...',
+  groq: 'gsk_...',
+  openrouter: 'sk-or-...',
   ollama: '(optional)',
 }
 

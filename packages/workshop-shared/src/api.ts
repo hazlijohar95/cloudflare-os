@@ -1133,7 +1133,8 @@ export type CloudflareAccountOption = {
 };
 
 /** Supported AI providers. */
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "cerebras" | "ollama";
+export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "cerebras"
+    | "deepseek" | "groq" | "openrouter" | "ollama";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -1212,6 +1213,29 @@ export const SUGGESTED_MODELS: Record<
   "cerebras": {
     "gpt-oss-120b": {name: "GPT OSS 120B (Cerebras)", contextWindow: 131072},
     "gemma-4-31b": {name: "Gemma 4 31B (Cerebras)", contextWindow: 131072},
+  },
+  // DeepSeek's V4 line. The legacy deepseek-chat / deepseek-reasoner aliases were retired on
+  // 2026-07-24 and are deliberately absent. Thinking mode is the V4 default.
+  "deepseek": {
+    "deepseek-v4-flash": {name: "DeepSeek V4 Flash", contextWindow: 1000000},
+    "deepseek-v4-pro": {name: "DeepSeek V4 Pro", contextWindow: 1000000},
+  },
+  "groq": {
+    "openai/gpt-oss-120b": {
+      name: "GPT OSS 120B (Groq)", contextWindow: 131072, outputLimit: 65536,
+    },
+    "llama-3.3-70b-versatile": {
+      name: "Llama 3.3 70B (Groq)", contextWindow: 131072, outputLimit: 32768,
+    },
+    "llama-3.1-8b-instant": {
+      name: "Llama 3.1 8B Instant (Groq)", contextWindow: 131072, outputLimit: 131072,
+    },
+  },
+  // OpenRouter proxies many upstream models, so there is no fixed catalog: these are a starting
+  // point and any `vendor/model` id can be entered by hand. Windows are the upstream models'.
+  "openrouter": {
+    "anthropic/claude-sonnet-4.5": {name: "Claude Sonnet 4.5 (OpenRouter)", contextWindow: 200000},
+    "openai/gpt-5-mini": {name: "GPT 5 Mini (OpenRouter)", contextWindow: 400000},
   },
   "ollama": {
   },
