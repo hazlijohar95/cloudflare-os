@@ -4669,7 +4669,10 @@ class OverseerImpl implements AgentHooks {
   // let a never-verified party see the data -- the record is what observer verification and the
   // coverage guard run against, and for an unverifiable record it is what denies non-owner opens
   // outright -- even though the restricted data outlives it in chat history and storage.
-  async removalBlockedByRestrictedData(id: WorkpieceId): Promise<boolean> {
+  //
+  // Deliberately synchronous (the sharing manager is a parameter, not an internal await) so each
+  // caller can check and delete in one synchronous block -- see GatekeeperClientImpl.remove().
+  removalBlockedByRestrictedData(id: WorkpieceId, sharing: SharingManager): boolean {
     if (!this.storage.prohibitAllSharing.get()) return false;
     // An empty producer set with the latch set should be impossible: the latch and the action
     // record are written in one synchronous block, built-in observations never latch, and
@@ -4678,7 +4681,6 @@ class OverseerImpl implements AgentHooks {
     // every connection rather than none.
     let producers = this.restrictedProducerIds();
     if (producers.size > 0 && !producers.has(id)) return false;
-    let sharing = await this.getSharingManager();
     return sharing.listCollaborators().length > 0 || sharing.listShareLinkRecords().length > 0;
   }
 
@@ -6389,11 +6391,14 @@ class OverseerImpl implements AgentHooks {
     // single round trip both provisions them and reads them back before we wire up capsules.
     let accounts = (await ownerDo.listProvidedAccounts())
         .filter(account => account.description.singleton?.tsType);
+    let sharing = await this.getSharingManager();
 
     // Reconcile existing ambient capsule records against the owner's current singleton accounts. Each
     // record is keyed to a specific accountId; if that account is gone (disconnected) or was replaced
     // (an optional account removed and re-added with a new accountId), the record is stale and would
-    // point the capsule at a deleted account — so remove it. Snapshot the list since we mutate it.
+    // point the capsule at a deleted account — so remove it. With the sharing manager fetched above,
+    // the loop is fully synchronous: each removal-blocked check runs in the same synchronous block as
+    // the delete it gates, and the snapshot below cannot go stale mid-iteration.
     let currentAccountId = new Map(accounts.map(account => [account.vendorId, account.accountId]));
     let bound = new Set<string>();
     // Snapshot before iterating, since removeGatekeeper() mutates the collection.
@@ -6402,7 +6407,7 @@ class OverseerImpl implements AgentHooks {
       if (gk.creationSpec?.type !== "ambient") continue;
       if (currentAccountId.get(gk.creationSpec.vendorId) === gk.creationSpec.accountId) {
         bound.add(gk.creationSpec.vendorId);
-      } else if (await this.removalBlockedByRestrictedData(gk.id)) {
+      } else if (this.removalBlockedByRestrictedData(gk.id, sharing)) {
         // A stale ambient record that anchors restricted-data verification must survive until
         // the owner unshares -- deleting it here would be the same unchecked readmission
         // GatekeeperClientImpl.remove() guards against, minus the user intent. Not added to
@@ -8563,8 +8568,11 @@ class OverseerImpl implements AgentHooks {
       //    addObserver calls succeed. The two run in one synchronous block: for a share-key
       //    redemption the gate is the topology re-check plus the confirming grant, so success
       //    writes the grant and the record atomically, while a denial throws into the catch
-      //    below and rolls back like any other verification failure. Creating/updating the
-      //    record is the canonical moment the user becomes a configured observer.
+      //    below and rolls back like any other verification failure. The pair is also
+      //    *crash*-atomic: storage writes in one synchronous block (no intervening await) are
+      //    coalesced into a single atomic commit, so a crash persists both or neither.
+      //    Creating/updating the record is the canonical moment the user becomes a configured
+      //    observer.
       commitGate?.();
       this.storage.observers.put({profileId, observerId, accountChoices});
     } catch (err) {
@@ -11733,7 +11741,6 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
   }
 
   async remove(): Promise<void> {
-    let record = this.impl.storage.gatekeepers.get(this.id);
     // A connection that has read restricted data is the anchor observer verification runs
     // against: while the workspace is shared, deleting its record would let a never-verified
     // collaborator open unchecked even though the data persists in chat history and storage.
@@ -11750,7 +11757,13 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
     // (restrictedProducerIds() reads the never-forgetting action log) -- deliberate: nothing can
     // verify a collaborator for the removed producer's data anymore, so the recovery for an
     // owner who needs to share again is a new workspace.
-    if (record && await this.impl.removalBlockedByRestrictedData(this.id)) {
+    let sharing = await this.impl.getSharingManager();
+    // Checked in the same synchronous block as the delete, after the only await (cf.
+    // addCollaborator): a check ahead of the yield could pass, a concurrent grant land during
+    // it, and the delete still run past it. The grant side's own check+write block is likewise
+    // synchronous, so it either sees the delete or is seen here.
+    let record = this.impl.storage.gatekeepers.get(this.id);
+    if (record && this.impl.removalBlockedByRestrictedData(this.id, sharing)) {
       throw new Error(
           "This connection cannot be removed: it has read sensitive data into this " +
           "workspace, and the workspace is shared. Collaborators are verified against this " +

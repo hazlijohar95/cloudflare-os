@@ -90,7 +90,7 @@ describe("authorizeObservation's synchronous check-and-latch", () => {
       // must already hold while the teardown is still in flight. Pre-fix both read false here:
       // the producer could be removed and new sharing granted mid-observation.
       expect(impl.storage.prohibitAllSharing.get()).toBe(true);
-      await expect(impl.removalBlockedByRestrictedData(1)).resolves.toBe(true);
+      expect(impl.removalBlockedByRestrictedData(1, await impl.getSharingManager())).toBe(true);
 
       held.resolve();
       await expect(observation).resolves.toBeUndefined();

@@ -90,7 +90,7 @@ describe("removalBlockedByRestrictedData", () => {
       seedRestrictedObservation(impl, 1, 100);
       seedCollaborator(impl);
 
-      await expect(impl.removalBlockedByRestrictedData(1)).resolves.toBe(false);
+      expect(impl.removalBlockedByRestrictedData(1, await impl.getSharingManager())).toBe(false);
     });
   });
 
@@ -104,8 +104,9 @@ describe("removalBlockedByRestrictedData", () => {
       impl.storage.prohibitAllSharing.put(true);
       seedCollaborator(impl);
 
-      await expect(impl.removalBlockedByRestrictedData(2)).resolves.toBe(false);
-      await expect(impl.removalBlockedByRestrictedData(1)).resolves.toBe(true);
+      let sharing = await impl.getSharingManager();
+      expect(impl.removalBlockedByRestrictedData(2, sharing)).toBe(false);
+      expect(impl.removalBlockedByRestrictedData(1, sharing)).toBe(true);
     });
   });
 
@@ -120,7 +121,7 @@ describe("removalBlockedByRestrictedData", () => {
 
       // The legacy record is what denies every non-owner open (#inScopeGatekeepers throws on
       // it), so removing it while shared would readmit the collaborator unverified.
-      await expect(impl.removalBlockedByRestrictedData(1)).resolves.toBe(true);
+      expect(impl.removalBlockedByRestrictedData(1, await impl.getSharingManager())).toBe(true);
     });
   });
 
@@ -135,7 +136,7 @@ describe("removalBlockedByRestrictedData", () => {
 
       // No collaborator yet, but the link's keys are multi-redeemable and redemption is gated
       // only while the record exists.
-      await expect(impl.removalBlockedByRestrictedData(1)).resolves.toBe(true);
+      expect(impl.removalBlockedByRestrictedData(1, await impl.getSharingManager())).toBe(true);
     });
   });
 
@@ -147,7 +148,7 @@ describe("removalBlockedByRestrictedData", () => {
       seedRestrictedObservation(impl, 1, 100);
       impl.storage.prohibitAllSharing.put(true);
 
-      await expect(impl.removalBlockedByRestrictedData(1)).resolves.toBe(false);
+      expect(impl.removalBlockedByRestrictedData(1, await impl.getSharingManager())).toBe(false);
     });
   });
 
@@ -161,7 +162,55 @@ describe("removalBlockedByRestrictedData", () => {
       impl.storage.prohibitAllSharing.put(true);
       seedCollaborator(impl);
 
-      await expect(impl.removalBlockedByRestrictedData(1)).resolves.toBe(true);
+      expect(impl.removalBlockedByRestrictedData(1, await impl.getSharingManager())).toBe(true);
+    });
+  });
+});
+
+// GatekeeperClientImpl.remove() must make its decision against sharing state read *after* its
+// only real yield (the cold sharing manager's whoami RPC) and in the same synchronous block as
+// the delete: a grant landing during the yield is seen by the check, and nothing can land
+// between the check and the delete. Pinned by parking whoami on a deferred so the yield is a
+// real in-test suspension point.
+describe("GatekeeperClientImpl.remove ordering", () => {
+  it("sees a collaborator granted while the sharing manager is being fetched", async () => {
+    let stub = env.TEST_OVERSEER.getByName("producer-removal-mid-yield-grant");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      // Not getImpl(): impl.ownerProfileId stays unset so getSharingManager() must fetch the
+      // owner profile through the (stubbed) owner User DO -- the parked deferred below.
+      let impl = (instance as unknown as { impl: any }).impl;
+      let releaseWhoami!: (profile: { id: string; name: string }) => void;
+      let whoami = new Promise<{ id: string; name: string }>(resolve => {
+        releaseWhoami = resolve;
+      });
+      impl.ownerId = "owner-do-id";
+      impl.users = {
+        idFromString: (id: string) => id,
+        get: () => ({ whoami: () => whoami }),
+      };
+      impl.getGatekeeperFacet = () => ({
+        describe: async () => ({ title: "Producer", url: "test://producer" }),
+      });
+
+      // A real client for a real record, so the test drives the actual remove() path.
+      let client = await impl.addGatekeeper({} as any, {
+        type: "gatekeeper",
+        vendorId: "testvendor",
+        resourceUrl: "https://example.com/producer",
+        typeUrlPattern: "https://*",
+      });
+      let id = await client.getId();
+      seedRestrictedObservation(impl, id, 100);
+      impl.storage.prohibitAllSharing.put(true);
+
+      // Start the removal: it runs synchronously up to the parked whoami. Grant a collaborator
+      // mid-park, then release -- the decision must see the grant and refuse.
+      let removal = client.remove();
+      seedCollaborator(impl);
+      releaseWhoami({ id: OWNER, name: "Alice" });
+
+      await expect(removal).rejects.toThrow(/cannot be removed/);
+      expect(impl.storage.gatekeepers.get(id)).toBeDefined();
     });
   });
 });
