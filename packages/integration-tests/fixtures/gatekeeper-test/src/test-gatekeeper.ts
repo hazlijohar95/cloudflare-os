@@ -257,7 +257,7 @@ export class TestSession extends RpcTarget {
     return `the contents of ${this.#title}`;
   }
 
-  async doThing(opts?: { autoApprovable?: boolean }): Promise<void> {
+  async doThing(opts?: { autoApprovable?: boolean; warnings?: string[] }): Promise<void> {
     await this.#queue.submitAction(0, {
       title: `Poke ${this.#title}`,
       description: `The test poked ${this.#title}.`,
@@ -267,6 +267,7 @@ export class TestSession extends RpcTarget {
       // set it.
       actionKind: POKE_ACTION_KIND,
       ...(opts?.autoApprovable ? { autoApprovable: true } : {}),
+      ...(opts?.warnings ? { operatorWarnings: opts.warnings } : {}),
     });
   }
 

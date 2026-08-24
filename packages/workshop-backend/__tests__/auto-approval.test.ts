@@ -33,7 +33,7 @@ function enableRule(storage: AutoApprovalStorage, actionTag = "edit", gatekeeper
 function putAction(
     storage: AutoApprovalStorage, id: number,
     opts: { gatekeeperId?: number; actionTag?: string; autoApprovable?: boolean;
-            state?: ActionRecord["state"] } = {}) {
+            operatorWarnings?: string[]; state?: ActionRecord["state"] } = {}) {
   storage.actions.put({
     id,
     gatekeeperId: opts.gatekeeperId ?? GK,
@@ -48,6 +48,7 @@ function putAction(
       implementsRevert: true,
       actionKind: { tag: opts.actionTag ?? "edit", label: "Edits" },
       autoApprovable: opts.autoApprovable ?? true,
+      ...(opts.operatorWarnings ? { operatorWarnings: opts.operatorWarnings } : {}),
     },
   });
 }
@@ -218,6 +219,20 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(getAction(storage, 2).state).toBe("approved");
   });
 
+  it("stops at a warned action without skipping ahead", async () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    putAction(storage, 1, { operatorWarnings: ["cross-account data risk"] });
+    putAction(storage, 2);
+
+    let apply = makeImmediateApply(storage);
+    await new AutoApprovalDrainer(storage, apply.applyFn).drain(GK);
+
+    expect(apply.calls).toEqual([]);
+    expect(getAction(storage, 1).state).toBe("pending");
+    expect(getAction(storage, 2).state).toBe("pending");
+  });
+
   it("applies nothing while the workspace is latched, even with a matching rule", async () => {
     let storage = makeStorage();
     enableRule(storage);
@@ -275,6 +290,17 @@ describe("autoApprovalRule", () => {
     expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
     enableRule(storage, "delete", GK);    // right gatekeeper, wrong tag
     expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+  });
+
+  it("refuses any action carrying operator warnings", () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    expect(autoApprovalRule(
+        storage, GK, eligibleDescription({ operatorWarnings: ["watch out"] })))
+        .toBeUndefined();
+    // An empty array carries no warning to read, so it does not disqualify.
+    expect(autoApprovalRule(storage, GK, eligibleDescription({ operatorWarnings: [] })))
+        .toBeDefined();
   });
 
   it("refuses every action while the restricted-data latch is set", () => {

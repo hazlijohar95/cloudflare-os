@@ -29,6 +29,8 @@ export interface AutoApprovalStorage {
  * rule iff ALL of:
  *  - the gatekeeper author marked this specific action `autoApprovable`,
  *  - the action carries an `actionKind` for which the user enabled a rule on this gatekeeper,
+ *  - the action carries no `operatorWarnings` (a warning exists precisely to be read by the
+ *    human approver, so it forces manual approval),
  *  - the workspace has not latched restricted mode (`prohibitAllSharing` above).
  * Returns undefined otherwise: manual approval required.
  */
@@ -38,6 +40,9 @@ export function autoApprovalRule(
   if (description.autoApprovable !== true) return undefined;
   let tag = description.actionKind?.tag;
   if (tag === undefined) return undefined;
+  if (description.operatorWarnings !== undefined && description.operatorWarnings.length > 0) {
+    return undefined;
+  }
   if (storage.prohibitAllSharing.get()) return undefined;
   return storage.autoApproveTags.get(`${gatekeeperId}:${tag}`);
 }
@@ -83,7 +88,7 @@ export class AutoApprovalDrainer {
   // nothing is silently applied past a human gate.
   //
   // Eligibility is `autoApprovalRule()`: the author's `autoApprovable` verdict, a user-enabled
-  // rule for the action's kind, and no restricted-data latch.
+  // rule for the action's kind, no operator warnings, and no restricted-data latch.
   async #drainOnce(gatekeeperId: number): Promise<void> {
     // Materialize a snapshot first: list() is a lazy generator over storage, and we mutate the
     // actions collection (via applyPendingAction) as we go.

@@ -1,13 +1,14 @@
-// Tests for the auto-approval policy gate around sensitive data.
+// Tests for the auto-approval policy gates around sensitive data and operator warnings.
 //
 // Auto-approval requires the author's per-action `autoApprovable` verdict AND a user-enabled rule
-// for the action's kind. The restricted-data latch must additionally force manual approval no
-// matter what -- even when the rule was enabled before the data was read. (The web-fetch
-// restriction has no client-reachable surface, so it is not asserted here.)
+// for the action's kind. Two things must additionally force manual approval no matter what:
+// `operatorWarnings` on the action (a warning exists to be read by a human), and the
+// restricted-data latch -- even when the rule was enabled before the data was read. (The
+// web-fetch restriction has no client-reachable surface, so it is not asserted here.)
 //
 // The fixture gatekeeper's session drives this through the real ApprovalQueue funnel: `doThing()`
-// submits a "poke" action with the given verdict, and `applyAction` succeeds, so the drain's
-// submit -> auto-approve -> apply round trip is the real one.
+// submits a "poke" action with the given verdict/warnings, and `applyAction` succeeds, so the
+// drain's submit -> auto-approve -> apply round trip is the real one.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { RpcStub } from "capnweb";
@@ -103,6 +104,33 @@ describe("auto-approval policy", () => {
         return poke?.state === "approved" ? poke : null;
       });
       expect(applied.autoApproved).toBe(true);
+    });
+  });
+
+  it.concurrent("a warned action holds the queue until a human approves it", async () => {
+    await withSession(async publicApi => {
+      const ws = await newWorkspace(publicApi, "warned");
+      await ws.overseer.setAutoApprovedActionKind(ws.gatekeeperId, POKE);
+
+      // The warned action is fully rule-covered and author-approved -- only the warning stands
+      // between it and auto-application. A clean eligible action behind it must not be applied
+      // either (the drain never skips ahead of a manual gate).
+      await ws.session.doThing({ autoApprovable: true, warnings: ["Cross-account data risk."] });
+      await ws.session.doThing({ autoApprovable: true });
+      await settle(ws);
+
+      const pokes = await listPokes(ws);
+      expect(pokes.map(p => p.state)).toEqual(["pending", "pending"]);
+      expect(pokes[0].description.operatorWarnings).toEqual(["Cross-account data risk."]);
+
+      // A human approving the warned action clears the gate; the one behind it then auto-applies.
+      await ws.overseer.approveAction(pokes[0].id);
+      const drained = await waitFor("the queued poke to auto-apply", async () => {
+        const [first, second] = await listPokes(ws);
+        return first.state === "approved" && second?.state === "approved" ? [first, second] : null;
+      });
+      expect(drained[0].autoApproved).toBeFalsy();
+      expect(drained[1].autoApproved).toBe(true);
     });
   });
 

@@ -1184,6 +1184,17 @@ export type ActionDescription = {
    */
   autoApprovable?: boolean;
 
+  /**
+   * Gatekeeper-authored warnings addressed to the human approver, rendered prominently on the
+   * approval card ahead of the description. Use these when the gatekeeper knows something about
+   * the *context* of the action that the action's own content can't show -- e.g. "this
+   * conversation has read data from other accounts, which could leak into this write."
+   *
+   * A warning exists precisely to be read by a human, so any action carrying one is never
+   * auto-approved, even if `autoApprovable` is set and a matching rule exists.
+   */
+  operatorWarnings?: string[];
+
   // ----------------------------------------------------------------------------
   // Policy hints
   //
