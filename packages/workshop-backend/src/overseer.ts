@@ -8150,6 +8150,16 @@ class OverseerImpl implements AgentHooks {
               "verified. Open the workspace again to retry.");
         }
 
+        // The link may have been revoked -- or its creator's own access lost -- while verification
+        // waited (possibly on the configuration modal). Pending edges are invisible to
+        // revocation's affected-set teardown, so this gate is the only place that can deny before
+        // anything is persisted: a throw here rides the first-ever rollback (no observer record,
+        // no gatekeeper registrations) and open()'s catch severs the pending edge.
+        if (!sharing.getEffectiveRole(profileId, pendingLinkId)) {
+          throw new Error(
+              "Your access to this workspace was revoked while it was being verified.");
+        }
+
         // Re-assert the redemption policy in the same synchronous block as the granting write.
         // The gate at redeemShareKey ran with the *pending* write, before this open's await
         // windows (ensureCapsules, ensureObserver); a restricted-data producer removed *before*
@@ -8165,18 +8175,18 @@ class OverseerImpl implements AgentHooks {
     await this.ensureObserver(profileId, clientUser, role, opts.configureCb, commitGate);
     if (opts.pendingLinkId === undefined) return role;
 
-    // Re-derive the role from the live graph now that the edge is confirmed. Pending edges are
-    // invisible to revokeShareLink's affected-set computation, so no revocation restart aborts a
-    // mid-verification redeemer whose link was revoked while verification waited (possibly on the
-    // configuration modal) -- this re-check is what denies them: a revoked link contributes
-    // nothing, so the role collapses. The just-confirmed edge then lingers inert, like any edge
-    // of a revoked link under the lazy model.
+    // Re-derive the role from the live graph now that the edge is confirmed. A revocation (or
+    // creator-access loss) landing mid-verification is expected to be denied by the commit gate
+    // above, before anything persists; this re-check is the residual guard for a change landing
+    // in the await gaps *after* the gate ran -- a revoked link contributes nothing, so the role
+    // collapses to null and open() rejects. In that narrow window the just-confirmed edge lingers
+    // inert, like any edge of a revoked link under the lazy model.
     let confirmed = sharing.getEffectiveRole(profileId);
     if (!confirmed ||
         (opts.requireRole && roleRank(confirmed) < roleRank(opts.requireRole))) {
       return null;
     }
-    // Decreases pass through (this re-derivation is the revocation catch above), but an increase
+    // Decreases pass through (this re-derivation is the residual revocation guard), but an increase
     // -- say an owner grant of "build" landing while verification waited on the configuration
     // modal -- must not ride out on this open: ensureObserver verified the caller at `role`, and
     // a wider role widens the gatekeeper scope that verification must cover. The raise takes
@@ -8843,13 +8853,14 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         throw err;
       }
       if (!effectiveRole) {
-        // A null role means the redeemed link's creator is currently unreachable in the
-        // permission graph -- or the link itself was revoked while verification was in flight
-        // (authorizeCollaborator re-derives the role after confirming the edge). Withdraw this
-        // open's claim here too: otherwise the recipient persists as an inert collaborator
-        // who springs back -- unverified -- if the creator regains access. In the revoked-link
-        // case the edge was already confirmed, so this is a no-op and the confirmed edge lingers
-        // inert (lazy model).
+        // A null role means the redeemed link's creator became unreachable in the permission
+        // graph -- or the link itself was revoked -- in the narrow window between
+        // authorizeCollaborator's commit gate (which denies either change landing during
+        // verification, before anything persists) and its post-confirm re-derivation. Withdraw
+        // this open's claim here too: otherwise the recipient persists as an inert collaborator
+        // who springs back -- unverified -- if the creator regains access. The edge was already
+        // confirmed in this window, so for it the revert is a no-op and the confirmed edge
+        // lingers inert (lazy model).
         if (redemption) {
           sharing.revertShareKeyRedemption(profileId, redemption.linkId, redemption.attemptId);
         }

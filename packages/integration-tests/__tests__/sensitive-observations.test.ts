@@ -522,6 +522,62 @@ describe("sensitive observations", () => {
     });
   });
 
+  it.concurrent(
+      "a link revoked mid-verification denies the redeeming open and leaves no observer residue",
+      async () => {
+    await withSession(async publicApi => {
+      const ws = await newWorkspace(publicApi, "mid-revoke");
+      await expect(ws.session.readThing(true)).resolves.toContain("mid-revoke");
+
+      const { key, linkId } = await ws.overseer.createShareLink("build", "mid-revoke");
+
+      const [dave] = nextUsernames("dave");
+      const daveApi = await signUp(publicApi, dave);
+      const daveAccount = await provisionAccount(daveApi);
+
+      // Park Dave's keyed open at the configuration prompt; while it waits, Alice revokes the
+      // link. Dave's pending edge is invisible to the revocation's affected-set computation, so
+      // no revocation restart aborts him -- the commit gate is what must deny the open, before
+      // any observer state persists.
+      let releaseConfig!: () => void;
+      const gate = new Promise<void>(resolve => { releaseConfig = resolve; });
+      const recorder = new ObserverConfigRecorder()
+          .respondWith(async needs => {
+            await gate;
+            return needs.map(n => ({ gatekeeperId: n.gatekeeperId, accountId: daveAccount.id }));
+          })
+          .alwaysChoose(daveAccount.id, MAX_OBSERVER_PROMPTS - 1);
+      const callback = stubFor(recorder);
+      try {
+        const gatedOpen = daveApi.openGadget(ws.gadgetId, key, callback).then(
+          overseer => { overseer[Symbol.dispose](); return null; },
+          (err: unknown) => err as Error);
+
+        await waitFor("Dave's open to reach the configuration prompt",
+            async () => recorder.callCount > 0 ? true : null);
+
+        // Dave is pending-only, so the revocation affects nobody (no revocation restart).
+        await expect(ws.overseer.revokeShareLink(linkId, [])).resolves.toEqual([]);
+
+        releaseConfig();
+        const error = await gatedOpen;
+        expect(error).not.toBeNull();
+        expect(error!.message).toMatch(/revoked while it was being verified/i);
+      } finally {
+        callback[Symbol.dispose]();
+      }
+
+      // The denied redemption was reverted: no collaborator persists.
+      await expect(ws.overseer.listCollaborators()).resolves.toEqual([]);
+
+      // And no observer coverage persists either: re-granted, Dave must block restricted reads
+      // until an open re-verifies him, exactly like any other unverified collaborator. Residual
+      // coverage from the denied open would let this read through.
+      await ws.overseer.addCollaborator(dave, "build");
+      await expect(ws.session.readThing(true)).rejects.toThrow(/has not been verified/i);
+    });
+  });
+
   it.concurrent("a latched connection cannot be removed while the workspace is shared",
       async () => {
     await withSession(async publicApi => {
