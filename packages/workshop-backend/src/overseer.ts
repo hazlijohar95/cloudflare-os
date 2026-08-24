@@ -766,6 +766,12 @@ type ExternalMessageRecord = {
 type ExternalMessageResponseTargetRegistration = {
   idempotencyKey: string;
   chatGatewayRpcTarget: NativeRpcStub<ChatGatewayRpcTarget>;
+  // Re-asserts the submitting caller's authorization; newChat/sendChatMessage run it as the first
+  // statement of the transaction that commits the prompt and registers the response target --
+  // strictly after their internal awaits -- so a caller whose access went stale in the window
+  // since receiveExternalMessage's entry gate aborts the transaction and commits nothing (see
+  // assertCollaboratorStillVerified). Absent for the owner, whose access cannot go stale.
+  assertStillAuthorized?: () => void;
 };
 
 type ExternalMessageResponseTargetRegistrationDecision =
@@ -5425,6 +5431,11 @@ class OverseerImpl implements AgentHooks {
     let chatId!: number;
     let timestamp = this.getChatTimestamp();
     this.ctx.storage.transactionSync(() => {
+      // Re-assert an external caller's authorization atomically with the writes it justifies:
+      // every await above (message preparation included) was a window in which it may have gone
+      // stale, and a throw here aborts the transaction -- no chat, no message, no response
+      // target -- before startAgent below can run over the chat tail.
+      responseTargetRegistration?.assertStillAuthorized?.();
       chatId = this.nextChatId();
       let meta: AiChatMetadata = {
         id: chatId,
@@ -5513,6 +5524,8 @@ class OverseerImpl implements AgentHooks {
       meta.activeAgent = userMeta.aiModel.profile;
     }
     this.ctx.storage.transactionSync(() => {
+      // See newChat: a stale external caller must abort before anything commits.
+      responseTargetRegistration?.assertStillAuthorized?.();
       this.storage.chatMeta.put(meta);
       let promptSequence = this.#commitPreparedChatMessage(
           chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,
@@ -7992,6 +8005,33 @@ class OverseerImpl implements AgentHooks {
     return this.#inScopeGatekeepers(role).map(observerBindingNeed);
   }
 
+  // Re-assert, synchronously, what authorizeCollaborator established for `profileId` when it
+  // admitted them: an effective role of at least `requireRole`, and -- when their live
+  // verification scope is nonempty -- a persisted observer record covering every in-scope
+  // gatekeeper. This mirrors ensureObserver's success invariant exactly: on success it persists a
+  // record whose accountChoices cover the whole scope, and an empty scope persists no record at
+  // all (hence the nonempty guard -- no spurious failures). The scope is recomputed live, so a
+  // gatekeeper *added* since the entry gate fails closed, like the redemption scope check. For
+  // entry points whose entry gate is separated from the write it justifies by real await windows
+  // (receiveExternalMessage), in which a concurrent verification's fail() may have scrubbed the
+  // caller's coverage or a sharing change severed their role. The sharing manager is a parameter,
+  // not an internal await, so the caller can run this inside the same synchronous block as the
+  // write (the house rule -- cf. authorizeObservation).
+  assertCollaboratorStillVerified(
+      profileId: string, requireRole: CollaboratorRole, sharing: SharingManager): void {
+    let role = sharing.getEffectiveRole(profileId);
+    if (!role || roleRank(role) < roleRank(requireRole)) {
+      throw new Error("You no longer have access to this workspace.");
+    }
+    let inScope = this.#inScopeGatekeepers(role);
+    if (inScope.length === 0) return;
+    let record = this.storage.observers.get(profileId);
+    if (!record || inScope.some(gk => !(gk.id in record.accountChoices))) {
+      throw new Error(
+          "Your verification for the data this workspace has read is no longer valid.");
+    }
+  }
+
   // Best-effort `removeObserver(observerId)` across the given gatekeeper ids. Never throws; logs
   // and continues on error. An orphaned observer entry only ever causes superfluous future checks,
   // never a data leak (the leak-relevant gate is authorizeObservation, which keys off the live
@@ -8065,7 +8105,8 @@ class OverseerImpl implements AgentHooks {
   // `pendingLinkId` names a share-key redemption this same open() just performed (see
   // redeemShareKey): the redeemed edge is pending -- it grants no authority to anyone -- so the
   // role is computed as though it were confirmed, verification runs against that hypothetical
-  // role, and only on success is the edge confirmed for real.
+  // role, and only on success is the edge confirmed for real -- via the commit gate below, in the
+  // same synchronous step that persists the observer record.
   async authorizeCollaborator(
       profileId: string,
       clientUser: DurableObjectStub<UserDurableObject>,
@@ -8078,40 +8119,52 @@ class OverseerImpl implements AgentHooks {
     let role = sharing.getEffectiveRole(profileId, opts.pendingLinkId);
     if (!role || (opts.requireRole && roleRank(role) < roleRank(opts.requireRole))) return null;
 
-    // For a pending redemption, capture the verification-scope generation in the same synchronous
-    // tick as ensureObserver's own #inScopeGatekeepers snapshot. ensureObserver may park
-    // unboundedly on the recipient's configuration modal, and a connection added (or a binding
-    // made) in that window would otherwise be invisible to the verification yet covered by the
-    // confirmed grant -- an already-confirmed collaborator in the same window is caught by the
-    // coverage guard, but a pending redeemer is invisible to it. A generation, not a value
-    // snapshot: a change *reverted* within the window must deny too (see #scopeGeneration).
-    let scopeBefore = opts.pendingLinkId !== undefined ? this.#scopeGeneration : null;
+    // For a pending redemption, hand ensureObserver a commit gate: the topology re-check plus the
+    // confirming grant, run synchronously with the write that persists the observer record. A
+    // denial therefore throws *inside* ensureObserver's try, taking the same first-ever-failure
+    // rollback as any verification refusal -- no observer record, no lingering gatekeeper
+    // registrations, no pending id -- so a rejected redeemer leaves nothing behind (a leftover
+    // record would read as "lost access" to #decideExcludeObservers and break the !record
+    // discriminator on retry). Success writes the confirming grant and the record back-to-back
+    // inside the per-profile verification lock.
+    let commitGate: (() => void) | undefined;
+    if (opts.pendingLinkId !== undefined) {
+      let pendingLinkId = opts.pendingLinkId;
+      // Capture the verification-scope generation in the same synchronous tick as
+      // ensureObserver's own #inScopeGatekeepers snapshot. ensureObserver may park unboundedly on
+      // the recipient's configuration modal, and a connection added (or a binding made) in that
+      // window would otherwise be invisible to the verification yet covered by the confirmed
+      // grant -- an already-confirmed collaborator in the same window is caught by the coverage
+      // guard, but a pending redeemer is invisible to it. A generation, not a value snapshot: a
+      // change *reverted* within the window must deny too (see #scopeGeneration).
+      let scopeBefore = this.#scopeGeneration;
+      commitGate = () => {
+        // Deny on *any* topology change -- additions, removals, and bind-changes alike -- rather
+        // than re-verifying: the throw lands in open()'s catch, which severs the pending edge,
+        // and the recipient's retained share key makes the retry re-redeem and re-verify against
+        // the full new topology (where the redemption policy gate refuses if a producer is now
+        // gone).
+        if (scopeBefore !== this.#scopeGeneration) {
+          throw new Error(
+              "A connection or binding changed in this workspace while your access was being " +
+              "verified. Open the workspace again to retry.");
+        }
 
-    await this.ensureObserver(profileId, clientUser, role, opts.configureCb);
-    if (opts.pendingLinkId === undefined) return role;
-
-    // Deny on *any* topology change -- additions, removals, and bind-changes alike -- rather
-    // than re-verifying: the throw lands in open()'s catch, which severs the pending edge, and
-    // the recipient's retained share key makes the retry re-redeem and re-verify against the
-    // full new topology (where the redemption policy gate refuses if a producer is now gone).
-    // This check, the confirm, and the role re-derivation below form one synchronous block, so
-    // any change landing after it sees the recipient in listCollaborators() and the coverage
-    // guard fail-closes -- the same protection ordinary opens have.
-    if (scopeBefore !== this.#scopeGeneration) {
-      throw new Error(
-          "A connection or binding changed in this workspace while your access was being " +
-          "verified. Open the workspace again to retry.");
+        // Re-assert the redemption policy in the same synchronous block as the granting write.
+        // The gate at redeemShareKey ran with the *pending* write, before this open's await
+        // windows (ensureCapsules, ensureObserver); a restricted-data producer removed *before*
+        // the generation snapshot above was taken doesn't bump it -- an unverifiable producer's
+        // remove() skips the share-link guard entirely -- so the scope check cannot catch it,
+        // and confirming would admit a recipient nobody can verify for the restricted data. The
+        // throw lands in open()'s catch, which severs the pending edge.
+        sharing.confirmShareKeyRedemption(
+            profileId, pendingLinkId, () => this.assertNewSharingAllowed());
+      };
     }
 
-    // Re-assert the redemption policy in the same synchronous block as the granting write. The
-    // gate at redeemShareKey ran with the *pending* write, before this open's await windows
-    // (ensureCapsules, ensureObserver); a restricted-data producer removed *before* the
-    // fingerprint snapshot above was taken is absent from both fingerprints -- an unverifiable
-    // producer's remove() skips the share-link guard entirely -- so the scope check cannot catch
-    // it, and confirming would admit a recipient nobody can verify for the restricted data. The
-    // throw lands in open()'s catch, which severs the pending edge.
-    sharing.confirmShareKeyRedemption(
-        profileId, opts.pendingLinkId, () => this.assertNewSharingAllowed());
+    await this.ensureObserver(profileId, clientUser, role, opts.configureCb, commitGate);
+    if (opts.pendingLinkId === undefined) return role;
+
     // Re-derive the role from the live graph now that the edge is confirmed. Pending edges are
     // invisible to revokeShareLink's affected-set computation, so no revocation restart aborts a
     // mid-verification redeemer whose link was revoked while verification waited (possibly on the
@@ -8162,19 +8215,29 @@ class OverseerImpl implements AgentHooks {
   // Google gatekeeper's credential lock. Serializing only per profile keeps distinct
   // collaborators' opens concurrent.
   //
+  // `commitGate`, when given, runs synchronously at each success exit -- immediately before the
+  // step-6 record persist, or at the nothing-to-verify early return -- inside the per-profile
+  // lock. A throw denies the verification and takes the same rollback path as any other failure,
+  // so the caller can piggyback its own commit-time checks and writes (a redemption's topology
+  // re-check and confirming grant) on the record persist's synchronous block. Running the gate
+  // *inside* the lock matters: a gate invoked after this method returned would run after the
+  // lock's release, so a queued sibling verification for the same profile would start against no
+  // record and mint a second observerId, breaking the shared-id invariant.
+  //
   // See observers-implementation-plan.md §5 Step 3.
   async ensureObserver(
       profileId: string,
       clientUser: DurableObjectStub<UserDurableObject>,
       role: CollaboratorRole,
-      configureCb?: RpcStub<ObserverConfigCallback>): Promise<void> {
+      configureCb?: RpcStub<ObserverConfigCallback>,
+      commitGate?: () => void): Promise<void> {
     let previous = this.#observerVerification.get(profileId) ?? Promise.resolve();
     let release!: () => void;
     let current = new Promise<void>(resolve => { release = resolve; });
     this.#observerVerification.set(profileId, current);
     await previous;
     try {
-      await this.#ensureObserverLocked(profileId, clientUser, role, configureCb);
+      await this.#ensureObserverLocked(profileId, clientUser, role, configureCb, commitGate);
     } finally {
       release();
       if (this.#observerVerification.get(profileId) === current) {
@@ -8187,7 +8250,8 @@ class OverseerImpl implements AgentHooks {
       profileId: string,
       clientUser: DurableObjectStub<UserDurableObject>,
       role: CollaboratorRole,
-      configureCb?: RpcStub<ObserverConfigCallback>): Promise<void> {
+      configureCb?: RpcStub<ObserverConfigCallback>,
+      commitGate?: () => void): Promise<void> {
     // 1. Select in-scope gatekeepers. If none require an account, there is nothing to verify
     //    (built-in gatekeepers never name observers in excludeObservers).
     let inScope = this.#inScopeGatekeepers(role);
@@ -8215,7 +8279,13 @@ class OverseerImpl implements AgentHooks {
       }
       if (pruned) this.storage.observers.put(record);
     }
-    if (inScope.length === 0) return;
+    if (inScope.length === 0) {
+      // Nothing to verify, but this is still a success exit: a redemption with an empty scope
+      // must still run its commit gate, or the confirming grant would never be written. Nothing
+      // has been minted at this point, so a throw here has no rollback to do.
+      commitGate?.();
+      return;
+    }
 
     // Build a working copy of the (pruned) account choices.
     let accountChoices: {[gatekeeperId: number]: number} = {...record?.accountChoices};
@@ -8229,9 +8299,9 @@ class OverseerImpl implements AgentHooks {
     let observerId = record?.observerId ?? crypto.randomUUID();
     // A freshly minted id becomes visible to gatekeepers at the first addObserver below, but
     // resolvable via byObserverId only at the step-6 put -- hold it in #pendingObserverIds across
-    // that window so #decideExcludeObservers can fail closed on it. The put and the finally's
-    // delete run synchronously back-to-back, so there is no gap where neither the map nor the
-    // index resolves the id.
+    // that window so #decideExcludeObservers can fail closed on it. The commit gate, the put, and
+    // the finally's delete run synchronously back-to-back (the gate is synchronous by contract),
+    // so there is no gap where neither the map nor the index resolves the id.
     if (!record) this.#pendingObserverIds.set(observerId, profileId);
     // Gatekeepers we successfully registered the observer with during this call.
     let newlyAdded = new Set<number>();
@@ -8400,14 +8470,22 @@ class OverseerImpl implements AgentHooks {
         break;
       }
 
-      // 6. Persist the observer record only after all addObserver calls succeed. Creating/updating
-      //    the record is the canonical moment the user becomes a configured observer.
+      // 6. Run the caller's commit gate, then persist the observer record, only after all
+      //    addObserver calls succeed. The two run in one synchronous block: for a share-key
+      //    redemption the gate is the topology re-check plus the confirming grant, so success
+      //    writes the grant and the record atomically, while a denial throws into the catch
+      //    below and rolls back like any other verification failure. Creating/updating the
+      //    record is the canonical moment the user becomes a configured observer.
+      commitGate?.();
       this.storage.observers.put({profileId, observerId, accountChoices});
     } catch (err) {
       // Roll back gatekeeper registrations only for a *first-ever* verification (no persisted
       // record at call start -- the same discriminator as #pendingObserverIds): that collaborator
       // was never admitted, has no live session, and once the pending entry is dropped in the
-      // finally their minted id would linger unresolvable inside the gatekeepers. For a
+      // finally their minted id would linger unresolvable inside the gatekeepers. A commit-gate
+      // denial (a redemption refused at confirm time) lands here too, which is what keeps the
+      // discriminator truthful: a denied redemption persists nothing, so "no record" still means
+      // "never admitted". For a
       // re-verification failure the registrations are deliberately kept: coverage was already
       // scrubbed synchronously in fail() (so the coverage guard fails closed on restricted
       // reads), while the registration is what preserves forward exclusion -- byObserverId keeps
@@ -8856,19 +8934,25 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // accounts here, an unverified caller is sent to open the workspace, which is where
     // verification happens. Requiring "build" up front means a "use" collaborator gets the plain
     // denial below rather than being verified (or told to fix a verification failure) for access
-    // this path can never grant them.
+    // this path can never grant them. The gate is then re-asserted synchronously with the prompt
+    // commit (assertStillAuthorized below): the awaits between here and sendChatMessage/newChat
+    // are windows in which a concurrent verification failure or sharing change can strip the
+    // caller's access, and the reply must not leave the Workshop on a check that went stale.
+    let unverifiedDenial = (err: unknown): SubmitExternalMessageResult => ({
+      accepted: false,
+      message: "Your access to the data this workspace has read could not be verified. Open " +
+          "the workspace in your browser to verify your access, then try again. " +
+          `(${stringifyError(err)})`,
+    });
+    let verificationWentStale = false;
+    let assertStillAuthorized: (() => void) | undefined;
     if (ownerId !== callerId) {
       let role: CollaboratorRole | null;
       try {
         role = await this.impl.authorizeCollaborator(
             callerProfile.id, caller, {requireRole: "build"});
       } catch (err) {
-        return {
-          accepted: false,
-          message: "Your access to the data this workspace has read could not be verified. Open " +
-              "the workspace in your browser to verify your access, then try again. " +
-              `(${stringifyError(err)})`,
-        };
+        return unverifiedDenial(err);
       }
       if (role !== "build") {
         return {
@@ -8876,6 +8960,20 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
           message: "You do not have access to interact with this workspace through its agent.",
         };
       }
+      // The manager is resolved here (memoized; authorizeCollaborator just used it) so the
+      // commit-time re-assertion itself is fully synchronous. The flag discriminates the gate's
+      // own throw from ordinary submit errors, so the catch around the submit below can answer
+      // with the verification denial rather than rethrowing.
+      let sharing = await this.impl.getSharingManager();
+      let profileId = callerProfile.id;
+      assertStillAuthorized = () => {
+        try {
+          this.impl.assertCollaboratorStillVerified(profileId, "build", sharing);
+        } catch (err) {
+          verificationWentStale = true;
+          throw err;
+        }
+      };
     }
 
     // Complete pending registration in the owner's UserDO.
@@ -8918,29 +9016,35 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     let responseTargetRegistration: ExternalMessageResponseTargetRegistration = {
       idempotencyKey: input.idempotencyKey,
       chatGatewayRpcTarget: input.chatGatewayRpcTarget,
+      assertStillAuthorized,
     };
     let chatId: number;
-    if (externalChat) {
-      await this.impl.sendChatMessage(
-        caller,
-        userContext,
-        externalChat.chatId,
-        input.prompt,
-        undefined,
-        undefined,
-        responseTargetRegistration,
-      );
-      chatId = externalChat.chatId;
-    } else {
-      chatId = await this.impl.newChat(
-        caller,
-        userContext,
-        input.prompt,
-        undefined,
-        undefined,
-        responseTargetRegistration,
-        input.externalChatKey,
-      );
+    try {
+      if (externalChat) {
+        await this.impl.sendChatMessage(
+          caller,
+          userContext,
+          externalChat.chatId,
+          input.prompt,
+          undefined,
+          undefined,
+          responseTargetRegistration,
+        );
+        chatId = externalChat.chatId;
+      } else {
+        chatId = await this.impl.newChat(
+          caller,
+          userContext,
+          input.prompt,
+          undefined,
+          undefined,
+          responseTargetRegistration,
+          input.externalChatKey,
+        );
+      }
+    } catch (err) {
+      if (verificationWentStale) return unverifiedDenial(err);
+      throw err;
     }
 
     return { accepted: true, chatPath: `/workspace/${this.ctx.id.toString()}?chat=${chatId}` };

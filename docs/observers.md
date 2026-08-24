@@ -239,7 +239,11 @@ every non-owner entry point that can surface workspace data runs it — `open()`
 `receiveExternalMessage()` non-interactively (no configuration channel, so an unverified caller is
 told to open the workspace, which is where verification happens). An agent reply on the external
 path can surface anything the workspace already read, so it must not admit a collaborator with
-less verification than `open()` would demand.
+less verification than `open()` would demand. The external path additionally re-asserts the gate
+synchronously with its prompt commit (`assertCollaboratorStillVerified`, run as the first
+statement of the transaction that writes the prompt): its entry check is separated from the
+commit by real await windows, and a caller whose coverage was scrubbed or role severed in that
+window aborts the transaction before an agent turn can run.
 
 Add a private helper on `OverseerImpl`, roughly:
 
@@ -341,7 +345,9 @@ For each id in `description.excludeObservers`:
    no record, the id is not an active observer → ignore it — **unless** the id belongs to a
    first-time verification still in flight: `ensureObserver` registers a freshly minted id with
    gatekeepers (`addObserver`) before the record is persisted, and that window spans awaits
-   (sibling verifier RPCs, even the configuration modal). The overseer tracks such ids in an
+   (sibling verifier RPCs, even the configuration modal). For a share-key redemption the window
+   runs through the redemption's confirm itself, which executes as `ensureObserver`'s commit
+   gate in the same synchronous step as the record persist. The overseer tracks such ids in an
    in-memory pending map and **blocks** an observation naming one (fail closed, with a distinct
    "collaborator currently being verified" message) rather than reading it as unknown — otherwise
    the observation would proceed and the collaborator be admitted moments later with the data
@@ -381,8 +387,10 @@ downgrades — see the matching methods on `OverseerClientInterface` and `Sharin
   Safe to defer — an over-broad observer set only ever errs toward stricter future checks — but
   it keeps gatekeeper state tidy.
 - All these calls are best-effort: log and continue on error. An orphaned observer entry only
-  causes superfluous future checks, never a data leak (the leak-relevant gate is
-  `authorizeObservation`, which keys off the live sharing graph).
+  causes superfluous future checks, never a data leak: the leak-relevant gate is
+  `authorizeObservation`, which keys off the live sharing graph, and a record is only ever
+  persisted for a party who passed full verification — a denied share-key redemption persists
+  none, because its denial runs as `ensureObserver`'s commit gate, before the record is written.
 
 > Multi-gatekeeper sequencing/atomicity is an overseer implementation detail, not part of the
 > shared interface. Because `addObserver` is re-run every open and `removeObserver` is idempotent,
@@ -531,7 +539,9 @@ already in the JSDoc in `gatekeeper.ts`; add anything missing there rather than 
    *pending* write (`redeemShareKey`), and again in the *confirm's* synchronous block
    (`confirmShareKeyRedemption`, the granting write) — the two are separated by the redeeming
    open()'s await windows, so a producer removed anywhere between redemption and confirm still
-   refuses the grant. Existing grants are untouched: a *confirmed* edge skips both checks, so a
+   refuses the grant. That confirm-side block also persists the observer record: the confirm
+   runs as `ensureObserver`'s commit gate, immediately before the record write, so a refusal
+   persists neither and rolls back the redemption's gatekeeper registrations. Existing grants are untouched: a *confirmed* edge skips both checks, so a
    collaborator re-opening with a retained key stays a no-op. Concurrent redemptions of one link
    share a single pending edge, on which each open() holds its own claim
    (`PermissionEdge.pendingAttempts`): a failed open's revert withdraws only its own claim and
