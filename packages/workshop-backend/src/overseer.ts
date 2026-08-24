@@ -766,11 +766,15 @@ type ExternalMessageRecord = {
 type ExternalMessageResponseTargetRegistration = {
   idempotencyKey: string;
   chatGatewayRpcTarget: NativeRpcStub<ChatGatewayRpcTarget>;
-  // Re-asserts the submitting caller's authorization; newChat/sendChatMessage run it as the first
-  // statement of the transaction that commits the prompt and registers the response target --
-  // strictly after their internal awaits -- so a caller whose access went stale in the window
-  // since receiveExternalMessage's entry gate aborts the transaction and commits nothing (see
-  // assertCollaboratorStillVerified). Absent for the owner, whose access cannot go stale.
+  // Re-asserts the submitting caller's authorization, strictly after newChat/sendChatMessage's
+  // internal awaits and synchronously with every write the submission justifies, so a caller
+  // whose access went stale in the window since receiveExternalMessage's entry gate commits
+  // nothing (see assertCollaboratorStillVerified). newChat runs it as the first statement of the
+  // transaction that commits the prompt and registers the response target; sendChatMessage runs
+  // it just before materializeChatChanges -- its first write, which cannot move inside the
+  // transaction (non-transactional side effects) -- with no awaits between the check and the
+  // transaction, so the one check covers the whole synchronous write sequence. Absent for the
+  // owner, whose access cannot go stale.
   assertStillAuthorized?: () => void;
 };
 
@@ -5553,6 +5557,15 @@ class OverseerImpl implements AgentHooks {
         message, (canonicalAttachments?.length ?? 0) > 0);
 
     let meta = this.assertChatNotActive(chatId, true);
+    // Re-assert an external caller's authorization before *any* write this submission justifies
+    // -- which on this path starts with materializeChatChanges, not the transaction below: the
+    // materialization durably writes a "changes" chat message, retires and prunes change rows,
+    // and sets hasProposedChanges, none of which a stale caller may trigger. It stays outside
+    // the transaction because it has non-transactional side effects (proposedChangesChanged's
+    // facet abort, the TTL prune), so the check is hoisted instead; everything from here through
+    // the transactionSync is one synchronous block (no awaits), so this single check covers the
+    // whole write sequence -- same invariant as newChat, differently shaped.
+    responseTargetRegistration?.assertStillAuthorized?.();
     let result = this.materializeChatChanges(chatId, meta);
     if (result) meta = result.meta;
     meta.lastActive = this.getChatTimestamp();
@@ -5563,8 +5576,6 @@ class OverseerImpl implements AgentHooks {
       meta.activeAgent = userMeta.aiModel.profile;
     }
     this.ctx.storage.transactionSync(() => {
-      // See newChat: a stale external caller must abort before anything commits.
-      responseTargetRegistration?.assertStillAuthorized?.();
       this.storage.chatMeta.put(meta);
       let promptSequence = this.#commitPreparedChatMessage(
           chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,

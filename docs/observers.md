@@ -240,10 +240,13 @@ every non-owner entry point that can surface workspace data runs it — `open()`
 told to open the workspace, which is where verification happens). An agent reply on the external
 path can surface anything the workspace already read, so it must not admit a collaborator with
 less verification than `open()` would demand. The external path additionally re-asserts the gate
-synchronously with its prompt commit (`assertCollaboratorStillVerified`, run as the first
-statement of the transaction that writes the prompt): its entry check is separated from the
-commit by real await windows, and a caller whose coverage was scrubbed or role severed in that
-window aborts the transaction before an agent turn can run.
+synchronously with every write its submission justifies (`assertCollaboratorStillVerified`): its
+entry check is separated from the commit by real await windows, and a caller whose coverage was
+scrubbed or role severed in that window must commit nothing before an agent turn can run. On the
+new-chat path the re-check is the first statement of the transaction that writes the prompt; on
+the existing-chat path it runs just before `materializeChatChanges` -- the submission's first
+write, which has non-transactional side effects and so cannot move inside the transaction --
+with no awaits between the check and the transaction.
 
 Add a private helper on `OverseerImpl`, roughly:
 

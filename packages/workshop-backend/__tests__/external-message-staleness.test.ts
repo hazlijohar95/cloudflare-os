@@ -3,9 +3,12 @@
 // preparation -- in which a concurrent verification's fail() can scrub the caller's coverage, a
 // sharing change can sever their role, or a new connection can widen the scope they were never
 // verified against. The agent then runs over the unfiltered chat tail and its reply leaves the
-// Workshop, so the authorization must be re-asserted synchronously with the commit: newChat and
-// sendChatMessage run the registration's assertStillAuthorized as the first statement of the
-// transaction that writes the prompt, so a stale caller aborts it -- no chat, no message, no
+// Workshop, so the authorization must be re-asserted synchronously with *every* write the
+// submission justifies: newChat runs the registration's assertStillAuthorized as the first
+// statement of the transaction that writes the prompt, and sendChatMessage runs it just before
+// materializeChatChanges (its first write, which has non-transactional side effects and so cannot
+// move inside the transaction; no awaits separate the check from the transaction). A stale caller
+// therefore commits nothing -- no chat, no message (not even a materialized "changes" one), no
 // response target, no agent turn.
 //
 // Runs against a real OverseerDurableObject (the TEST_OVERSEER binding, like
@@ -185,11 +188,20 @@ describe("receiveExternalMessage's commit-time authorization re-check", () => {
     let stub = env.TEST_OVERSEER.getByName("external-staleness-existing-chat");
     await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
       let state = setup(instance);
-      // A prior conversation already exists for this external chat key.
+      // A prior conversation already exists for this external chat key -- with a live change row,
+      // so that sendChatMessage's materializeChatChanges has something to write. Without the row
+      // this case passed vacuously: materialization no-oped, hiding that it used to run *before*
+      // the authorization re-check and durably wrote a "changes" message, retired the row, and
+      // set hasProposedChanges on a denied submission.
       let started = new Date();
       state.impl.storage.chatMeta.put(
           { id: 7, title: "Existing chat", started, lastActive: started });
       state.impl.storage.externalChats.put({ externalChatKey: "ext-existing", chatId: 7 });
+      state.impl.storage.chatChanges.put({
+        chatId: 7, generation: 0, revision: 1, timestamp: started,
+        author: { type: "user", id: "bob", name: "Bob" },
+        change: {}, source: "user",
+      });
 
       let result = instance.receiveExternalMessage(submitInput("existing"));
       await tick();
@@ -201,8 +213,14 @@ describe("receiveExternalMessage's commit-time authorization re-check", () => {
       state.releaseContext();
       await expect(result).resolves.toMatchObject({ accepted: false });
       expect((await result).message).toMatch(/could not be verified/);
-      // The chat survives but gained no message, no response target, no agent turn.
+      // The chat survives but gained no message -- not even a materialized "changes" message --
+      // no response target, no agent turn; the change row is still live and the chat's meta
+      // untouched.
       expect([...state.impl.storage.chats.list()]).toHaveLength(0);
+      let rows = [...state.impl.storage.chatChanges.list()];
+      expect(rows).toHaveLength(1);
+      expect(rows[0].retired).toBeUndefined();
+      expect(state.impl.storage.chatMeta.get(7).hasProposedChanges).toBeUndefined();
       expect(state.registrations).toBe(0);
       expect(state.startAgentCalls).toBe(0);
     });
