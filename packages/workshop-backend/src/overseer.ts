@@ -4746,7 +4746,11 @@ class OverseerImpl implements AgentHooks {
           "workspace was just revoked and whose sessions have not yet been disconnected.");
     }
     let lost: ObserverRecord[] = [];
-    for (let observerId of observerIds) {
+    // Deduped: the ids cross the RPC boundary from gatekeeper code, so nothing guarantees
+    // uniqueness, and a duplicate would push the same record into `lost` twice -- two teardown
+    // iterations for one observer, the second running from a snapshot the first's awaited
+    // fan-out staled (see #tearDownExcludedObservers).
+    for (let observerId of new Set(observerIds)) {
       if (this.#pendingObserverIds.has(observerId)) {
         throw new Error(
             "This observation was blocked because it contains data that a collaborator currently " +
@@ -4771,7 +4775,16 @@ class OverseerImpl implements AgentHooks {
     if (observers.length === 0) return;
     let gatekeeperIds = [...this.storage.gatekeepers.list()].map(gk => gk.id);
     for (let observer of observers) {
-      this.storage.observers.delete(observer.profileId);
+      // Each earlier iteration's awaited fan-out is a yield in which the profile may have been
+      // re-granted and re-verified, minting a replacement record under a new observerId; deleting
+      // by profileId from this method's (snapshotted) list would then remove the *replacement*,
+      // silently no-oping every exclusion that names the new id until the user's next open. So
+      // re-read and delete only the record actually snapshotted; the snapshotted id is still
+      // de-registered unconditionally (removeObserver is idempotent and the id is dead either
+      // way).
+      if (this.storage.observers.get(observer.profileId)?.observerId === observer.observerId) {
+        this.storage.observers.delete(observer.profileId);
+      }
       await this.#removeObserverFromGatekeepers(observer.observerId, gatekeeperIds);
     }
   }

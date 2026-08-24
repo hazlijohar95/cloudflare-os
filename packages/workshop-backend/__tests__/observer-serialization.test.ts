@@ -343,6 +343,56 @@ describe("excludeObservers naming a mid-registration observer", () => {
     });
   });
 
+  it("tears down a lost observer by observer id, tolerating duplicate ids and a mid-teardown " +
+      "re-verification", async () => {
+    let stub = env.TEST_OVERSEER.getByName("observer-excluded-teardown-by-id");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = (instance as unknown as { impl: any }).impl;
+      seedGatekeepers(impl);
+      impl.ownerProfileId = "owner";
+      // Bob lost access (no collaborator record) but his observer record lingers -- the state
+      // #decideExcludeObservers resolves to "lost" and #tearDownExcludedObservers cleans up.
+      impl.storage.observers.put(
+          { profileId: "bob", observerId: "obs-old", accountChoices: { 1: 10 } });
+
+      // Park the teardown's removeObserver fan-out. The ids cross the RPC boundary from
+      // gatekeeper code, so nothing guarantees uniqueness: a duplicate used to enter "lost"
+      // twice, and the second iteration's delete-by-profileId ran from a snapshot staled by the
+      // first iteration's await.
+      let held = deferred();
+      let removed: string[] = [];
+      impl.getGatekeeperFacet = () => ({
+        addObserver: async () => {},
+        removeObserver: async (id: string) => { removed.push(id); await held.promise; },
+      });
+      let observing = impl.authorizeObservation(
+          1, observation(["obs-old", "obs-old"]), { from: "user" });
+      await tick();
+
+      // Mid-park, bob is re-granted and a fresh verification completes, minting a replacement
+      // record under a new observerId.
+      impl.storage.collaborators.put({
+        profile: { type: "user", id: "bob", name: "Bob" },
+        addedBy: [{ type: "user", sharer: "owner", created: new Date(), role: "build" }],
+      });
+      impl.storage.observers.put(
+          { profileId: "bob", observerId: "obs-new", accountChoices: { 1: 10 } });
+
+      held.resolve();
+      await expect(observing).resolves.toBeUndefined();
+
+      // Pre-fix the duplicate's second iteration deleted the replacement record by profileId,
+      // after which exclusions naming obs-new silently no-oped (fail-open) until bob's next
+      // open. The teardown must delete only the record it snapshotted.
+      expect(impl.storage.observers.get("bob")?.observerId).toBe("obs-new");
+      await expect(impl.authorizeObservation(1, observation(["obs-new"]), { from: "user" }))
+          .rejects.toThrow(/current collaborator/);
+      // The snapshotted id was still de-registered from the gatekeepers, exactly once per
+      // gatekeeper (the duplicate deduped).
+      expect(removed.toSorted()).toEqual(["obs-old", "obs-old"]);
+    });
+  });
+
   it("hands off seamlessly to the persisted index on success", async () => {
     let stub = env.TEST_OVERSEER.getByName("observer-pending-exclusion-success");
     await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
