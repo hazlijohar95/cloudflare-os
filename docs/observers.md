@@ -362,6 +362,14 @@ For each id in `description.excludeObservers`:
      to observe; if they ever regain access they reconfigure from scratch (Step 3).
 3. If, after evaluating all excluded ids, none are still-authorized, allow the observation.
 
+Both this gate and the restricted-data coverage guard additionally fail closed whenever a
+revocation's restart is still pending (`#revocationRestartPending`, set synchronously with the
+sever in `tearDownLostObservers`): the DO abort that actually ends the removed user's live
+sessions runs only after the awaited teardown and listing-refresh phases, and in that window the
+removed user's deleted record makes their id read as "unknown → ignore" here, while removing the
+last collaborator empties the list the coverage guard iterates. See
+`OverseerImpl.scheduleRevocationRestart`.
+
 This is the runtime counterpart of `addObserver`: `addObserver` covers observers configured
 *after* data was read; `excludeObservers` covers data read *after* observers were configured.
 Persisting the observation record itself is unchanged; we only gate it.
@@ -379,9 +387,11 @@ methods wrapping `SharingManager` mutations (`removeCollaborator`, `revokeShareL
 downgrades — see the matching methods on `OverseerClientInterface` and `SharingManager`):
 
 - After a mutation, use the returned `AffectedCollaborator[]` to find users who **lost access**.
-  For each who is now unreachable, if they have an observer record: best-effort
-  `removeObserver(record.observerId)` on **all** gatekeeper facets, then delete the observer
-  record.
+  For each who is now unreachable, if they have an observer record: delete the observer record,
+  then best-effort `removeObserver(record.observerId)` on **all** gatekeeper facets. Any
+  non-empty affected set also sets `#revocationRestartPending` synchronously with the sever, so
+  the Step 5 gates fail closed until the revocation restart disconnects the affected users'
+  still-live sessions (the awaited fan-out here is part of why that restart is not immediate).
 - For a **`build` → `use` downgrade**, optionally `removeObserver` (and drop the corresponding
   `accountChoices` entries) for the now-out-of-scope bindings (those without a `bindingName`).
   Safe to defer — an over-broad observer set only ever errs toward stricter future checks — but

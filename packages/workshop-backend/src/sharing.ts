@@ -309,7 +309,8 @@ export class SharingManager {
    * severed the edge without a revocation restart, and this confirm quietly re-grants. Accepted
    * wart: the still-live link is re-redeemable anyway, so the removal never durably excluded this
    * recipient; a revoked link's re-added edge is inert (below); and a removal that visibly
-   * affects anyone restarts the DO within ~100ms, killing a parked open before it confirms.
+   * affects anyone restarts the DO promptly (after its awaited teardown and listing-refresh
+   * phases plus a ~100ms grace delay), killing a parked open before it confirms.
    * Note the race is narrower than it looks: a pending-only recipient is invisible to
    * listCollaborators too, so the removal UI cannot even target one mid-verification -- a racing
    * removal was necessarily aimed at an edge some earlier open had already confirmed. And the
