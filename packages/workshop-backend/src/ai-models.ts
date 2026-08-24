@@ -125,6 +125,54 @@ const API_STREAMS: Record<string, StreamFunction<Api, SimpleStreamOptions>> = {
 
 const ZERO_COST: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
+/**
+ * Providers that speak OpenAI's chat-completions API and are absent from pi's builtin catalog, so
+ * their model descriptors are synthesized entirely from this table.
+ *
+ * `gatewayPath` is the segment under an AI Gateway root. pi appends `/chat/completions` itself, and
+ * most passthroughs expose that directly under the provider segment -- OpenRouter is the exception,
+ * keeping upstream's `/v1` (see each provider's AI Gateway doc page). Getting this wrong 404s.
+ */
+const OPENAI_COMPAT_PROVIDERS = {
+  cerebras: {
+    gatewayPath: "cerebras", directBaseUrl: "https://api.cerebras.ai/v1", reasoning: false,
+  },
+  // DeepSeek's V4 line thinks by default; the other providers' listed models do not reason.
+  deepseek: {
+    gatewayPath: "deepseek", directBaseUrl: "https://api.deepseek.com/v1", reasoning: true,
+  },
+  groq: {
+    gatewayPath: "groq", directBaseUrl: "https://api.groq.com/openai/v1", reasoning: false,
+  },
+  openrouter: {
+    gatewayPath: "openrouter/v1", directBaseUrl: "https://openrouter.ai/api/v1", reasoning: false,
+  },
+} as const satisfies Record<string, {
+  gatewayPath: string; directBaseUrl: string; reasoning: boolean;
+}>;
+
+type OpenAiCompatProvider = keyof typeof OPENAI_COMPAT_PROVIDERS;
+
+// Descriptor for an {@link OPENAI_COMPAT_PROVIDERS} model, shared by the gateway and direct routes.
+// Costs are zero because these providers report none, and supportsDeveloperRole is off because
+// their APIs take the classic `system` role, not OpenAI's newer `developer` role.
+function openAiCompatModel(
+    provider: OpenAiCompatProvider, modelId: string, baseUrl: string,
+    window: { contextWindow: number, maxTokens: number }): Model<Api> {
+  return {
+    id: modelId,
+    name: modelId,
+    api: "openai-completions",
+    provider,
+    baseUrl,
+    reasoning: OPENAI_COMPAT_PROVIDERS[provider].reasoning,
+    input: ["text"],
+    cost: ZERO_COST,
+    ...window,
+    compat: { supportsDeveloperRole: false },
+  };
+}
+
 // Consult pi's builtin catalog for cost/compat metadata of a known model id. Unknown models are
 // fine (synthesized with zero cost). Import per-provider, not providers/all.
 function catalogModel(provider: AiModelConfig["provider"], modelId: string): Model<Api> | undefined {
@@ -133,10 +181,12 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
     case "openai": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
-    case "cerebras": return undefined;
-    case "deepseek": return undefined;
-    case "groq": return undefined;
-    case "openrouter": return undefined;
+    // Uncataloged: the OpenAI-compatible passthroughs, and ollama, which serves whatever the user
+    // has pulled locally.
+    case "cerebras":
+    case "deepseek":
+    case "groq":
+    case "openrouter":
     case "ollama": return undefined;
     default: return undefined;
   }
@@ -250,32 +300,15 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
     case "cerebras":
     case "deepseek":
     case "groq":
-    case "openrouter": {
-      // OpenAI-compatible providers served by the gateway's per-provider passthrough. pi appends
-      // `/chat/completions` to baseUrl, and these providers expose that directly under their
-      // gateway path -- except OpenRouter, whose passthrough keeps upstream's `/v1` segment (see
-      // each provider's AI Gateway doc page). None are in pi's builtin catalog, so every field is
-      // synthesized. supportsDeveloperRole is off: these APIs take the classic `system` role, not
-      // OpenAI's newer `developer` role.
-      const suffix = config.provider === "openrouter" ? "/v1" : "";
-      return {
-        id: config.model,
-        name: catalog?.name ?? config.model,
-        api: "openai-completions",
-        provider: config.provider,
-        baseUrl: `${gatewayUrl}/${config.provider}${suffix}`,
-        // DeepSeek V4 defaults to thinking mode; the others' listed models do not reason.
-        reasoning: config.provider === "deepseek",
-        input: ["text"],
-        cost: ZERO_COST,
-        ...window,
-        compat: { supportsDeveloperRole: false },
-      };
-    }
+    case "openrouter":
+      return openAiCompatModel(config.provider, config.model,
+          `${gatewayUrl}/${OPENAI_COMPAT_PROVIDERS[config.provider].gatewayPath}`, window);
     default:
       return undefined;
   }
 }
+
+// Case-insensitive response-header lookup (pi surfaces headers as a plain record).
 function getHeader(headers: Record<string, string>, name: string): string | undefined {
   if (headers[name] !== undefined) return headers[name];
   const lower = name.toLowerCase();
@@ -584,34 +617,18 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
     case "cerebras":
     case "deepseek":
     case "groq":
-    case "openrouter": {
-      // Direct access (no AI Gateway): each provider's own OpenAI-compatible endpoint, key from
-      // the config. Accepts and strips a trailing /v1 so a pasted full endpoint works too.
-      const defaultBase = {
-        cerebras: "https://api.cerebras.ai/v1",
-        deepseek: "https://api.deepseek.com/v1",
-        groq: "https://api.groq.com/openai/v1",
-        openrouter: "https://openrouter.ai/api/v1",
-      }[config.provider];
+    case "openrouter":
+      // Direct access (no AI Gateway): the provider's own endpoint, key from the config. A
+      // configured apiUrl wins, with a trailing /v1 tolerated so a pasted full endpoint works.
       return makeHandle({
-        model: {
-          id: config.model,
-          name: config.model,
-          api: "openai-completions",
-          provider: config.provider,
-          baseUrl: config.apiUrl
-              ? `${stripTrailingSlashes(config.apiUrl).replace(/\/v1$/, "")}/v1`
-              : defaultBase,
-          reasoning: config.provider === "deepseek",
-          input: ["text"],
-          cost: ZERO_COST,
-          ...window,
-          compat: { supportsDeveloperRole: false },
-        },
+        model: openAiCompatModel(config.provider, config.model,
+            config.apiUrl
+                ? `${stripTrailingSlashes(config.apiUrl).replace(/\/v1$/, "")}/v1`
+                : OPENAI_COMPAT_PROVIDERS[config.provider].directBaseUrl,
+            window),
         apiKey: config.apiToken,
         sessionAffinity,
       });
-    }
     case "google":
       return makeHandle({
         model: {
