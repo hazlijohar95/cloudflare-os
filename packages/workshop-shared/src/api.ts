@@ -1133,7 +1133,7 @@ export type CloudflareAccountOption = {
 };
 
 /** Supported AI providers. */
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "cerebras" | "ollama";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -1206,6 +1206,12 @@ export const SUGGESTED_MODELS: Record<
   },
   "google": {
     "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
+  },
+  // Cerebras serves an OpenAI-compatible API. Context windows are the paid-tier values (the free
+  // tier caps at 65k); output limits are not published, so they fall back to the catalog default.
+  "cerebras": {
+    "gpt-oss-120b": {name: "GPT OSS 120B (Cerebras)", contextWindow: 131072},
+    "gemma-4-31b": {name: "Gemma 4 31B (Cerebras)", contextWindow: 131072},
   },
   "ollama": {
   },

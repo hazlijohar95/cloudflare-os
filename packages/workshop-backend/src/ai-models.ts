@@ -133,6 +133,7 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
     case "openai": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
+    case "cerebras": return undefined;
     case "ollama": return undefined;
     default: return undefined;
   }
@@ -243,12 +244,26 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         ...window,
         compat: workersAiCompat(catalog),
       };
+    case "cerebras":
+      // Cerebras is an OpenAI-compatible provider served by the gateway's `cerebras` passthrough.
+      // Not in pi's builtin catalog, so every field is synthesized. supportsDeveloperRole is off:
+      // Cerebras' chat API takes the classic `system` role, not OpenAI's newer `developer` role.
+      return {
+        id: config.model,
+        name: catalog?.name ?? config.model,
+        api: "openai-completions",
+        provider: "cerebras",
+        baseUrl: `${gatewayUrl}/cerebras/v1`,
+        reasoning: false,
+        input: ["text"],
+        cost: ZERO_COST,
+        ...window,
+        compat: { supportsDeveloperRole: false },
+      };
     default:
       return undefined;
   }
 }
-
-// Case-insensitive response-header lookup (pi surfaces headers as a plain record).
 function getHeader(headers: Record<string, string>, name: string): string | undefined {
   if (headers[name] !== undefined) return headers[name];
   const lower = name.toLowerCase();
@@ -554,6 +569,25 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         sessionAffinity,
       });
     }
+    case "cerebras":
+      // Direct Cerebras access (no AI Gateway): OpenAI-compatible endpoint, key from the config.
+      return makeHandle({
+        model: {
+          id: config.model,
+          name: config.model,
+          api: "openai-completions",
+          provider: "cerebras",
+          baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "https://api.cerebras.ai")
+              .replace(/\/v1$/, "")}/v1`,
+          reasoning: false,
+          input: ["text"],
+          cost: ZERO_COST,
+          ...window,
+          compat: { supportsDeveloperRole: false },
+        },
+        apiKey: config.apiToken,
+        sessionAffinity,
+      });
     case "google":
       return makeHandle({
         model: {
