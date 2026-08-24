@@ -42,7 +42,7 @@ import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker"
 import { completeAgentCatalogSnapshot, normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord, roleRank } from "./sharing";
-import { AutoApprovalDrainer } from "./auto-approval";
+import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext, traced } from "./observability";
 import { retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
@@ -1025,8 +1025,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       nextHookId: 0,
 
       // True if any past observation was authorized that had the `containsRestrictedData` flag
-      // set in its `ObservationDescription`. While set, the workspace may not perform actions or
-      // fetch from the public web.
+      // set in its `ObservationDescription`. While set, the workspace may not fetch from the
+      // public web, and actions are limited to the connections that produced the restricted data
+      // (the writes-to-self carve-out; see restrictedProducerIds and submitAction), each
+      // requiring manual approval (never auto-approved; see autoApprovalRule).
       //
       // NOTE: The property CANNOT be renamed to match the flag: the typed-storage key is the
       // property name, so a rename would silently unlatch every workspace that has already
@@ -4647,8 +4649,9 @@ class OverseerImpl implements AgentHooks {
   // persists the record (authorizeObservation), so a latched workspace always yields a non-empty
   // set. Built-in tool observations are skipped: they name no connection, and the
   // BUILTIN_TOOL_GATEKEEPER_ID sentinel could never match a gatekeeper record (built-ins also
-  // never latch). Cold paths only (connection removal and sharing mutators), so the full scan is
-  // fine.
+  // never latch). The callers are cold paths (connection removal, sharing mutators) plus
+  // submitAction -- but the latter scans only while latched, and the auto-approval drainer
+  // already full-scans the log per drain, so the scan is fine where it runs.
   restrictedProducerIds(): Set<WorkpieceId> {
     let producers = new Set<WorkpieceId>();
     for (let record of this.storage.actions.list()) {
@@ -4847,10 +4850,19 @@ class OverseerImpl implements AgentHooks {
   async submitAction(gatekeeperId: number, action: number,
                      description: ActionDescription, caller: GatekeeperCaller)
       : Promise<void> {
-    if (this.storage.prohibitAllSharing.get()) {
+    // Writes-to-self carve-out: a latched workspace may still act on the connections that
+    // produced its restricted data -- sending the data back where it came from reveals nothing
+    // new to that system -- while any other target could leak it. (Every such action still
+    // requires manual human approval; see autoApprovalRule.) A latched workspace always has a
+    // non-empty producer set (the latch and its action record are written in one synchronous
+    // block; see restrictedProducerIds); if the set is ever empty anyway, the `has` check fails
+    // for every target and all actions are refused -- the conservative fallback. Refused before
+    // the id allocation below, so a blocked action leaves no record behind.
+    if (this.storage.prohibitAllSharing.get() &&
+        !this.restrictedProducerIds().has(gatekeeperId)) {
       throw new Error(
-          "This workspace has observed sensitive data. To prevent leaks, the workspace is prohibited " +
-          "from performing actions.");
+          "This workspace has observed sensitive data from other connections. To prevent leaks, " +
+          "it may only perform actions on those same connections.");
     }
 
     let actionId = this.storage.nextActionId.get();
@@ -4874,10 +4886,9 @@ class OverseerImpl implements AgentHooks {
     this.storage.actions.put(record);
     this.#associateAction(caller, actionId);
 
-    // Same auto-approval gate as before, named because awaitDecision uses it too. The drain is
-    // deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
-    let willAutoApprove = !!(description.autoApprovable && description.actionKind &&
-        this.storage.autoApproveTags.get(`${gatekeeperId}:${description.actionKind.tag}`) !== undefined);
+    // Same auto-approval gate the drainer uses, named because awaitDecision uses it too. The drain
+    // is deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
+    let willAutoApprove = autoApprovalRule(this.storage, gatekeeperId, description) !== undefined;
 
     // Only agent turns suspend on awaitDecision, and only when a manual decision is pending.
     // Auto-approved actions keep the seamless behavior the user opted into.
@@ -10286,6 +10297,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new Error(`No such gatekeeper: ${gatekeeperId}`);
     }
 
+    // A rule stored while the workspace is latched would never fire (see autoApprovalRule), so
+    // refuse to store one rather than let the UI suggest auto-approval is in effect.
+    if (this.impl.storage.prohibitAllSharing.get()) {
+      throw new Error(
+          "This workspace has observed sensitive data, so its actions always require manual " +
+          "approval and cannot be auto-approved.");
+    }
+
     let profile = await this.#getClientProfile();
     this.impl.storage.autoApproveTags.put({
       gatekeeperId,
@@ -10312,6 +10331,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async listPreApprovableActions(): Promise<PreApprovableAction[]> {
+    // A latched workspace can't have auto-approval rules (see setAutoApprovedActionKind), so
+    // offer nothing.
+    if (this.impl.storage.prohibitAllSharing.get()) return [];
+
     // Surface actions from every gatekeeper bound by some gadget (the connections the UI shows).
     let boundIds = new Set<WorkpieceId>();
     for (let gadget of this.impl.storage.gadgets.list()) {

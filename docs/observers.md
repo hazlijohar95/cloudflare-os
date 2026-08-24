@@ -34,7 +34,8 @@ The mechanism is a per-user, gatekeeper-mediated check — "this data may be sha
 people who *also* have access to it". (Maximally sensitive data gets an extra layer: an
 observation marked **`containsRestrictedData`**
 (`ObservationDescription.containsRestrictedData` in `packages/workshop-shared/src/gatekeeper.ts`)
-latches the workspace into a restricted mode — no actions, no web fetches — and is admitted only
+latches the workspace into a restricted mode — no web fetches, and actions only back to the
+connections that produced the restricted data, each manually approved — and is admitted only
 if every current collaborator has been verified against the gatekeeper producing it; see the
 coverage guard, `#assertSensitiveObservationCoverage`, in `overseer.ts` and edge case 4 below.)
 
@@ -465,7 +466,8 @@ already in the JSDoc in `gatekeeper.ts`; add anything missing there rather than 
    on any collaborator regardless of role). At open() time, `ensureObserver` re-verifies each
    collaborator against every in-scope gatekeeper, which is what admits (or refuses) them for
    sensitive data. The flag also latches the workspace into a restricted mode that blocks
-   actions and web fetches.
+   web fetches and limits actions to the connections that produced the restricted data, each
+   requiring manual approval.
    `use` scope is *live* binding state, with a transition case in each direction. Adding a
    binding grows it, and edge case 5 covers the interim. Unbinding shrinks it with no guard:
    a formerly-bound producer drops out of `use` verification scope, so its sensitive reads
