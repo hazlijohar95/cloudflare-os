@@ -8149,6 +8149,11 @@ class OverseerImpl implements AgentHooks {
   // role is computed as though it were confirmed, verification runs against that hypothetical
   // role, and only on success is the edge confirmed for real -- via the commit gate below, in the
   // same synchronous step that persists the observer record.
+  //
+  // Every caller gets a commit gate and the post-verification role re-derivation, not just
+  // redemptions: verification may park unboundedly (verifier RPCs, the configuration modal), and
+  // a removal landing in that window is otherwise caught only by the revocation restart, which
+  // fires after the awaited teardown/listing phases -- see the gate comment below.
   async authorizeCollaborator(
       profileId: string,
       clientUser: DurableObjectStub<UserDurableObject>,
@@ -8161,47 +8166,56 @@ class OverseerImpl implements AgentHooks {
     let role = sharing.getEffectiveRole(profileId, opts.pendingLinkId);
     if (!role || (opts.requireRole && roleRank(role) < roleRank(opts.requireRole))) return null;
 
-    // For a pending redemption, hand ensureObserver a commit gate: the topology re-check plus the
-    // confirming grant, run synchronously with the write that persists the observer record. A
-    // denial therefore throws *inside* ensureObserver's try, taking the same first-ever-failure
-    // rollback as any verification refusal -- no observer record, no lingering gatekeeper
-    // registrations, no pending id -- so a rejected redeemer leaves nothing behind (a leftover
-    // record would read as "lost access" to #decideExcludeObservers and break the !record
-    // discriminator on retry). Success writes the confirming grant and the record back-to-back
-    // inside the per-profile verification lock.
-    let commitGate: (() => void) | undefined;
-    if (opts.pendingLinkId !== undefined) {
-      let pendingLinkId = opts.pendingLinkId;
-      // Capture the verification-scope generation in the same synchronous tick as
-      // ensureObserver's own #inScopeGatekeepers snapshot. ensureObserver may park unboundedly on
-      // the recipient's configuration modal, and a connection added (or a binding made) in that
-      // window would otherwise be invisible to the verification yet covered by the confirmed
-      // grant -- an already-confirmed collaborator in the same window is caught by the coverage
-      // guard, but a pending redeemer is invisible to it. A generation, not a value snapshot: a
-      // change *reverted* within the window must deny too (see #scopeGeneration).
-      let scopeBefore = this.#scopeGeneration;
-      commitGate = () => {
-        // Deny on *any* topology change -- additions, removals, and bind-changes alike -- rather
-        // than re-verifying: the throw lands in open()'s catch, which severs the pending edge,
-        // and the recipient's retained share key makes the retry re-redeem and re-verify against
-        // the full new topology (where the redemption policy gate refuses if a producer is now
-        // gone).
-        if (scopeBefore !== this.#scopeGeneration) {
-          throw new Error(
-              "A connection or binding changed in this workspace while your access was being " +
-              "verified. Open the workspace again to retry.");
-        }
+    // Hand ensureObserver a commit gate: a live-role re-check for every caller, plus -- for a
+    // pending redemption -- the topology re-check and the confirming grant, all run synchronously
+    // with the write that persists the observer record. The role re-check is universal because
+    // verification parks across real await windows, in which the caller may be removed: for a
+    // redemption, pending edges are invisible to revocation's affected-set teardown, so this gate
+    // is the only place that can deny before anything is persisted; for a keyless open, the
+    // removal's teardown already deleted the caller's observer record, and without the gate
+    // step 6's put would *resurrect* it (record and account choices were loaded pre-park) --
+    // coverage a later re-grant would trust without re-verification -- and the open would hand
+    // out a full stale-role capability for however long the revocation restart takes to land.
+    // A denial throws *inside* ensureObserver's try: for a first-ever verification that takes
+    // the full rollback (no observer record, no lingering gatekeeper registrations, no pending
+    // id -- a rejected redeemer leaves nothing behind, since a leftover record would read as
+    // "lost access" to #decideExcludeObservers and break the !record discriminator on retry);
+    // for a returning collaborator it keeps the step-5 re-registrations, the documented-harmless
+    // orphan (see #removeObserverFromGatekeepers). Success runs the gate and the record persist
+    // back-to-back inside the per-profile verification lock.
+    //
+    // The topology check captures the verification-scope generation in the same synchronous tick
+    // as ensureObserver's own #inScopeGatekeepers snapshot: a connection added (or a binding
+    // made) while the recipient sat on the configuration modal would otherwise be invisible to
+    // the verification yet covered by the confirmed grant -- an already-confirmed collaborator
+    // in the same window is caught by the coverage guard, but a pending redeemer is invisible to
+    // it. A generation, not a value snapshot: a change *reverted* within the window must deny
+    // too (see #scopeGeneration). Redemption-only, because for a confirmed collaborator the
+    // coverage guard already owns that hazard.
+    let pendingLinkId = opts.pendingLinkId;
+    let scopeBefore = pendingLinkId !== undefined ? this.#scopeGeneration : undefined;
+    let commitGate = () => {
+      // Deny on *any* topology change -- additions, removals, and bind-changes alike -- rather
+      // than re-verifying: the throw lands in open()'s catch, which severs the pending edge,
+      // and the recipient's retained share key makes the retry re-redeem and re-verify against
+      // the full new topology (where the redemption policy gate refuses if a producer is now
+      // gone).
+      if (scopeBefore !== undefined && scopeBefore !== this.#scopeGeneration) {
+        throw new Error(
+            "A connection or binding changed in this workspace while your access was being " +
+            "verified. Open the workspace again to retry.");
+      }
 
-        // The link may have been revoked -- or its creator's own access lost -- while verification
-        // waited (possibly on the configuration modal). Pending edges are invisible to
-        // revocation's affected-set teardown, so this gate is the only place that can deny before
-        // anything is persisted: a throw here rides the first-ever rollback (no observer record,
-        // no gatekeeper registrations) and open()'s catch severs the pending edge.
-        if (!sharing.getEffectiveRole(profileId, pendingLinkId)) {
-          throw new Error(
-              "Your access to this workspace was revoked while it was being verified.");
-        }
+      // The caller's access may have been revoked -- or, for a redemption, the link revoked or
+      // its creator's own access lost -- while verification waited (possibly on the
+      // configuration modal). The throw lands in open()'s catch (which, for a redemption,
+      // severs the pending edge).
+      if (!sharing.getEffectiveRole(profileId, pendingLinkId)) {
+        throw new Error(
+            "Your access to this workspace was revoked while it was being verified.");
+      }
 
+      if (pendingLinkId !== undefined) {
         // Re-assert the redemption policy in the same synchronous block as the granting write.
         // The gate at redeemShareKey ran with the *pending* write, before this open's await
         // windows (ensureCapsules, ensureObserver); a restricted-data producer removed *before*
@@ -8211,29 +8225,28 @@ class OverseerImpl implements AgentHooks {
         // throw lands in open()'s catch, which severs the pending edge.
         sharing.confirmShareKeyRedemption(
             profileId, pendingLinkId, () => this.assertNewSharingAllowed());
-      };
-    }
+      }
+    };
 
     await this.ensureObserver(profileId, clientUser, role, opts.configureCb, commitGate);
-    if (opts.pendingLinkId === undefined) return role;
 
-    // Re-derive the role from the live graph now that the edge is confirmed. A revocation (or
-    // creator-access loss) landing mid-verification is expected to be denied by the commit gate
-    // above, before anything persists; this re-check is the residual guard for a change landing
-    // in the await gaps *after* the gate ran -- a revoked link contributes nothing, so the role
-    // collapses to null and open() rejects. In that narrow window the just-confirmed edge lingers
-    // inert, like any edge of a revoked link under the lazy model.
+    // Re-derive the role from the live graph -- for a redemption, now that the edge is
+    // confirmed. A revocation landing mid-verification is expected to be denied by the commit
+    // gate above, before anything persists; this re-check is the residual guard for a change
+    // landing in the await gaps *after* the gate ran -- the role collapses to null and open()
+    // rejects. For a redemption in that narrow window the just-confirmed edge lingers inert,
+    // like any edge of a revoked link under the lazy model.
     let confirmed = sharing.getEffectiveRole(profileId);
     if (!confirmed ||
         (opts.requireRole && roleRank(confirmed) < roleRank(opts.requireRole))) {
       return null;
     }
-    // Decreases pass through (this re-derivation is the residual revocation guard), but an increase
+    // Decreases pass through (verification at the wider pre-park role covers the narrower live
+    // scope, and the capability handed out must not exceed the live role), but an increase
     // -- say an owner grant of "build" landing while verification waited on the configuration
     // modal -- must not ride out on this open: ensureObserver verified the caller at `role`, and
     // a wider role widens the gatekeeper scope that verification must cover. The raise takes
-    // effect at the caller's next open, exactly as it does for an ordinary (keyless) open, which
-    // returns the role it verified at.
+    // effect at the caller's next open, which verifies at the wider scope.
     return roleRank(confirmed) < roleRank(role) ? confirmed : role;
   }
 
@@ -8895,14 +8908,15 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         throw err;
       }
       if (!effectiveRole) {
-        // A null role means the redeemed link's creator became unreachable in the permission
-        // graph -- or the link itself was revoked -- in the narrow window between
-        // authorizeCollaborator's commit gate (which denies either change landing during
-        // verification, before anything persists) and its post-confirm re-derivation. Withdraw
-        // this open's claim here too: otherwise the recipient persists as an inert collaborator
-        // who springs back -- unverified -- if the creator regains access. The edge was already
-        // confirmed in this window, so for it the revert is a no-op and the confirmed edge
-        // lingers inert (lazy model).
+        // A null role means the caller lost access in the narrow window between
+        // authorizeCollaborator's commit gate (which denies a change landing during
+        // verification) and its post-verification re-derivation: on the keyless path a plain
+        // removal, on the redemption path the redeemed link's creator becoming unreachable in
+        // the permission graph -- or the link itself being revoked -- after the edge was
+        // confirmed. For a redemption, withdraw this open's claim here too: otherwise the
+        // recipient persists as an inert collaborator who springs back -- unverified -- if the
+        // creator regains access. The edge was already confirmed in this window, so for it the
+        // revert is a no-op and the confirmed edge lingers inert (lazy model).
         if (redemption) {
           sharing.revertShareKeyRedemption(profileId, redemption.linkId, redemption.attemptId);
         }
