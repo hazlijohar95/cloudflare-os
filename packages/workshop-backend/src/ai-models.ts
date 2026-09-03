@@ -507,6 +507,10 @@ function getModelViaGateway(
 ): ModelHandle {
   const metadata = buildMetadata(initiator, options.metadata);
   const binding = gwConfig.bindingFor(config.provider);
+  // A non-default BYOK credential alias: without it the gateway looks up `default` and fails
+  // with 400 code 2040 ("has no BYOK credential named 'default'"). Applies to binding-routed
+  // requests too -- the binding exposes the same per-provider passthrough paths.
+  const byokAlias = gwConfig.byokAliasFor(config.provider);
   // No binding means either the provider can't ride one or the deployment has none; the second
   // case already required a token in the constructor, so this only fires for the first
   if (!binding && !gwConfig.apiToken) {
@@ -521,6 +525,7 @@ function getModelViaGateway(
         `Bearer ${binding ? CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL : gwConfig.apiToken}`,
     Authorization: null,
     "x-api-key": null,
+    ...(byokAlias ? { "cf-aig-byok-alias": byokAlias } : {}),
   };
   const gatewayBase =
       `https://gateway.ai.cloudflare.com/v1/${gwConfig.accountId}`;

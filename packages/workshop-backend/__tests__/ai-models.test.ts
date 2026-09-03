@@ -226,6 +226,29 @@ describe("getModel AI Gateway routing", () => {
     // Session affinity flows through (Workers AI models opt in to the affinity headers).
     expect(request.headers.get("x-session-affinity")).toBe("session-a");
   }, 15000);
+
+  it("sends cf-aig-byok-alias only for providers with a non-default alias", async () => {
+    const aliased = env({ CF_AI_GATEWAY_BYOK_ALIASES: '{"cerebras":"prod"}' });
+    const cerebras = getModel(aliased, {
+      provider: "cerebras",
+      model: "gpt-oss-120b",
+      apiToken: "ignored-in-gateway-mode",
+    }, INITIATOR);
+    expect(cerebras.model.baseUrl).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/cerebras");
+
+    const aliasedRequest = await captureRequest(cerebras);
+    expect(aliasedRequest.headers.get("cf-aig-byok-alias")).toBe("prod");
+
+    capturedRequests.length = 0;
+    const groq = getModel(aliased, {
+      provider: "groq",
+      model: "openai/gpt-oss-120b",
+      apiToken: "ignored-in-gateway-mode",
+    }, INITIATOR);
+    const defaultRequest = await captureRequest(groq);
+    expect(defaultRequest.headers.get("cf-aig-byok-alias")).toBeNull();
+  }, 15000);
 });
 
 describe("getModel AI Gateway binding transport", () => {
@@ -316,6 +339,22 @@ describe("getModel AI Gateway binding transport", () => {
       chatId: 7,
     });
     expect((JSON.parse(entry.body) as { model: string }).model).toBe("claude-sonnet-4-5");
+  }, 15000);
+
+  it("forwards the BYOK alias on binding-routed requests", async () => {
+    const handle = getModel(bindingEnv({
+      CF_AI_GATEWAY_PROVIDERS: "anthropic,cerebras",
+      CF_AI_GATEWAY_BYOK_ALIASES: '{"cerebras":"prod"}',
+    }), {
+      provider: "cerebras",
+      model: "gpt-oss-120b",
+      apiToken: "ignored-in-gateway-mode",
+    }, INITIATOR);
+
+    expect(handle.model.baseUrl).toBe(
+        "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/cerebras");
+    const entry = await captureEntry(handle);
+    expect(entry.headers["cf-aig-byok-alias"]).toBe("prod");
   }, 15000);
 
   it("drives Workers AI through the binding via its gateway route", async () => {

@@ -104,8 +104,7 @@ describe("AiGatewayConfig transport selection", () => {
     }))).toThrow("enabling the google provider requires CF_AI_GATEWAY_API_TOKEN");
   });
 
-  it("resolves the same-account gateway for binding-based callers (webFetch)", () => {
-    expect(new AiGatewayConfig(bindingOnly).sameAccountGateway).toBe("platform-gateway");
+  it("resolves the same-account gateway for binding-based callers (webFetch)", () => {    expect(new AiGatewayConfig(bindingOnly).sameAccountGateway).toBe("platform-gateway");
     expect(new AiGatewayConfig(env({
       CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
       CF_AI_GATEWAY_API_TOKEN: "gateway-token",
@@ -119,6 +118,38 @@ describe("AiGatewayConfig transport selection", () => {
       CF_AI_GATEWAY_API_TOKEN: "gateway-token",
       WORKERS_AI: undefined,
     })).sameAccountGateway).toBeUndefined();
+  });
+});
+
+describe("AiGatewayConfig BYOK aliases", () => {
+  const base = {
+    CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+    CF_AI_GATEWAY_API_TOKEN: "gateway-token",
+    WORKERS_AI: undefined,
+  };
+
+  it("defaults every provider to the gateway's `default` alias", () => {
+    const config = new AiGatewayConfig(env(base));
+    expect(config.byokAliasFor("cerebras")).toBeUndefined();
+    expect(config.byokAliasFor("openrouter")).toBeUndefined();
+  });
+
+  it("parses a provider-to-alias map", () => {
+    const config = new AiGatewayConfig(env({
+      ...base,
+      CF_AI_GATEWAY_BYOK_ALIASES: '{"cerebras":"prod","openrouter":"prod"}',
+    }));
+    expect(config.byokAliasFor("cerebras")).toBe("prod");
+    expect(config.byokAliasFor("openrouter")).toBe("prod");
+    expect(config.byokAliasFor("groq")).toBeUndefined();
+  });
+
+  it("rejects malformed alias maps", () => {
+    for (const raw of ['{"cerebras":', '["cerebras"]', '"cerebras"', '{"cerebras":42}',
+        '{"cerebras":""}', '{"cerebras":"has space!"}']) {
+      expect(() => new AiGatewayConfig(env({ ...base, CF_AI_GATEWAY_BYOK_ALIASES: raw })))
+          .toThrow("CF_AI_GATEWAY_BYOK_ALIASES");
+    }
   });
 });
 

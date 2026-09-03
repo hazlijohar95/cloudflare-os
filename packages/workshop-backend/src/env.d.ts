@@ -21,6 +21,10 @@ declare global {
       CF_AI_GATEWAY_API_TOKEN?: string;   // Run + Read token; optional when the binding transport
                                           // applies (still required for google)
       CF_AI_GATEWAY_USE_BINDING?: string;
+      // Optional JSON object mapping provider -> BYOK credential alias, e.g.
+      // '{"cerebras":"prod","openrouter":"prod"}'. Omitted providers use the gateway's
+      // `default` alias; requests for a mapped provider carry `cf-aig-byok-alias`.
+      CF_AI_GATEWAY_BYOK_ALIASES?: string;
       // Note: outside gateway mode, Workers AI (provider "cloudflare") is BYOK like every other
       // provider -- the account ID and API token live in the user's model config, not in env.
 

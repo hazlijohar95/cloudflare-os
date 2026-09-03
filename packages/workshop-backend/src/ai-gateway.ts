@@ -22,6 +22,41 @@ const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
  */
 const HTTPS_ONLY_PROVIDERS = new Set(["google"]);
 
+/**
+ * BYOK credential aliases are gateway-side names; `default` is what the dashboard assigns unless
+ * the operator types a custom one. Keep the pattern tight so a pasted secret or URL fails here,
+ * at boot, rather than as a 400 from inside a chat.
+ */
+const BYOK_ALIAS_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * Parse `CF_AI_GATEWAY_BYOK_ALIASES` (a JSON object of provider -> alias) into a lookup map.
+ * Absent or empty means every provider uses the gateway's `default` alias.
+ */
+function parseByokAliases(raw: string | undefined): Map<string, string> {
+  if (raw === undefined || raw.trim() === "") return new Map();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("CF_AI_GATEWAY_BYOK_ALIASES must be a JSON object of provider to alias, " +
+        'e.g. \'{"cerebras":"prod"}\'.');
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("CF_AI_GATEWAY_BYOK_ALIASES must be a JSON object of provider to alias, " +
+        'e.g. \'{"cerebras":"prod"}\'.');
+  }
+  const result = new Map<string, string>();
+  for (const [provider, alias] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof alias !== "string" || !BYOK_ALIAS_PATTERN.test(alias)) {
+      throw new Error(`CF_AI_GATEWAY_BYOK_ALIASES has an invalid alias for provider ` +
+          `"${provider}": aliases must match ${BYOK_ALIAS_PATTERN}.`);
+    }
+    result.set(provider, alias);
+  }
+  return result;
+}
+
 export class AiGatewayConfig {
   readonly gateway: string;
   /**
@@ -47,6 +82,12 @@ export class AiGatewayConfig {
    */
   readonly binding?: Ai;
   readonly providers: Set<string>;
+  /**
+   * Per-provider BYOK credential aliases. Providers absent from the map use the gateway's
+   * `default` alias. The alias travels as `cf-aig-byok-alias`, which the gateway honors on
+   * direct provider-passthrough routes -- the only routes this backend uses.
+   */
+  readonly byokAliases: ReadonlyMap<string, string>;
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -75,6 +116,7 @@ export class AiGatewayConfig {
     this.providers = new Set(
       (env.CF_AI_GATEWAY_PROVIDERS || "").split(",").map(s => s.trim()).filter(s => s !== "")
     );
+    this.byokAliases = parseByokAliases(env.CF_AI_GATEWAY_BYOK_ALIASES);
     const httpsOnly = [...this.providers].filter(p => HTTPS_ONLY_PROVIDERS.has(p));
     if (httpsOnly.length > 0 && !this.apiToken) {
       const names = httpsOnly.join(", ");
@@ -92,6 +134,14 @@ export class AiGatewayConfig {
    */
   bindingFor(provider: string): Ai | undefined {
     return HTTPS_ONLY_PROVIDERS.has(provider) ? undefined : this.binding;
+  }
+
+  /**
+   * The BYOK credential alias to request for a provider, or undefined when the gateway's
+   * `default` alias applies. Callers send the result as `cf-aig-byok-alias`.
+   */
+  byokAliasFor(provider: string): string | undefined {
+    return this.byokAliases.get(provider);
   }
 
   /**

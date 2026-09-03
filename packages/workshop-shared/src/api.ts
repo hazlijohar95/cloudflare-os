@@ -1225,14 +1225,14 @@ export const SUGGESTED_MODELS: Record<
     "deepseek-v4-pro": {name: "DeepSeek V4 Pro", contextWindow: 1000000},
   },
   "groq": {
+    // Groq's generally-available OpenAI-compat models. The Llama 3.x versatile/instant IDs are
+    // Enterprise-only on Groq and 404 for standard keys, so they are deliberately absent --
+    // same policy as DeepSeek's retired aliases below.
     "openai/gpt-oss-120b": {
       name: "GPT OSS 120B (Groq)", contextWindow: 131072, outputLimit: 65536,
     },
-    "llama-3.3-70b-versatile": {
-      name: "Llama 3.3 70B (Groq)", contextWindow: 131072, outputLimit: 32768,
-    },
-    "llama-3.1-8b-instant": {
-      name: "Llama 3.1 8B Instant (Groq)", contextWindow: 131072, outputLimit: 131072,
+    "openai/gpt-oss-20b": {
+      name: "GPT OSS 20B (Groq)", contextWindow: 131072, outputLimit: 65536,
     },
   },
   // OpenRouter proxies many upstream models, so there is no fixed catalog: these are a starting
